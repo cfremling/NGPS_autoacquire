@@ -13,7 +13,7 @@
 //
 // Multi-extension support:
 // - Prefers EXTNAME="L" by default (left), falls back to extnum=1 if not found.
-
+ 
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
