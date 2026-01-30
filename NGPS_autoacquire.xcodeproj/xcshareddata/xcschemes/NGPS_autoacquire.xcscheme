@@ -57,6 +57,10 @@
             isEnabled = "YES">
          </CommandLineArgument>
          <CommandLineArgument
+            argument = " --search-x1 80 --search-x2 160 --search-y1 30 --search-y2 210"
+            isEnabled = "YES">
+         </CommandLineArgument>
+         <CommandLineArgument
             argument = "--max-dist 20"
             isEnabled = "YES">
          </CommandLineArgument>

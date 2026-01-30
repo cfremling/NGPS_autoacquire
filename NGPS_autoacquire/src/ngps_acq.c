@@ -13,7 +13,16 @@
 //
 // Multi-extension support:
 // - Prefers EXTNAME="L" by default (left), falls back to extnum=1 if not found.
- 
+//
+// ROI support:
+// - Background/noise statistics can be computed on a large user ROI (bg ROI).
+// - Candidate search is done on a (typically smaller) user ROI (search ROI),
+//   and then intersected with the goal-centered radius window (max-dist).
+// - Centroid window is small (centroid-hw) and is clamped to the search ROI.
+//
+// ROI coordinates are interpreted in the same origin as --goal-x/--goal-y
+// controlled by --pixel-origin (0 or 1). ROI bounds are inclusive.
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +45,12 @@
 #define PATH_MAX 4096
 #endif
 
+// ROI mask bits
+#define ROI_X1_SET 0x01
+#define ROI_X2_SET 0x02
+#define ROI_Y1_SET 0x04
+#define ROI_Y2_SET 0x08
+
 typedef struct {
   char   input[PATH_MAX];  // directory OR file
   char   dir[PATH_MAX];    // if directory mode, this is the directory used
@@ -54,6 +69,16 @@ typedef struct {
   // FITS selection
   int    extnum;           // fallback: 0=primary, 1=first extension, etc.
   char   extname[32];      // preferred: e.g. "L" (left). Empty => use extnum.
+
+  // Background statistics ROI (typically the illuminated / on-sky region)
+  int    bg_roi_mask;      // bitmask of which bg ROI bounds were set
+  long   bg_x1, bg_x2;
+  long   bg_y1, bg_y2;
+
+  // Candidate search ROI (typically smaller subset around the goal)
+  int    search_roi_mask;  // bitmask of which search ROI bounds were set
+  long   search_x1, search_x2;
+  long   search_y1, search_y2;
 
   double poll_sec;         // directory scan interval
   int    dry_run;
@@ -113,22 +138,94 @@ static int path_is_file(const char* p) {
   return S_ISREG(st.st_mode);
 }
 
-// robust median + MAD using subsample stride
-static void robust_median_mad(const float* img, long nx, long ny,
-                             double* med_out, double* sigma_out)
+// Convert a user-specified ROI (mask + bounds in user origin) into clamped 0-based inclusive bounds.
+// If mask is 0, returns full-frame bounds.
+static void compute_roi_0based(long nx, long ny, int pixel_origin,
+                               int mask, long ux1_in, long ux2_in, long uy1_in, long uy2_in,
+                               long* x1, long* x2, long* y1, long* y2)
 {
-  long N = nx * ny;
+  // Defaults in user coordinate system
+  long ux1 = (pixel_origin == 0) ? 0  : 1;
+  long ux2 = (pixel_origin == 0) ? (nx - 1) : nx;
+  long uy1 = (pixel_origin == 0) ? 0  : 1;
+  long uy2 = (pixel_origin == 0) ? (ny - 1) : ny;
+
+  if (mask & ROI_X1_SET) ux1 = ux1_in;
+  if (mask & ROI_X2_SET) ux2 = ux2_in;
+  if (mask & ROI_Y1_SET) uy1 = uy1_in;
+  if (mask & ROI_Y2_SET) uy2 = uy2_in;
+
+  // Convert to 0-based indices
+  long ax1 = ux1;
+  long ax2 = ux2;
+  long ay1 = uy1;
+  long ay2 = uy2;
+
+  if (pixel_origin == 1) {
+    ax1 -= 1; ax2 -= 1;
+    ay1 -= 1; ay2 -= 1;
+  }
+
+  // Allow swapped bounds
+  if (ax2 < ax1) { long t = ax1; ax1 = ax2; ax2 = t; }
+  if (ay2 < ay1) { long t = ay1; ay1 = ay2; ay2 = t; }
+
+  // Clamp
+  if (ax1 < 0) ax1 = 0;
+  if (ay1 < 0) ay1 = 0;
+  if (ax2 > nx - 1) ax2 = nx - 1;
+  if (ay2 > ny - 1) ay2 = ny - 1;
+
+  // Ensure non-degenerate
+  if (ax2 < ax1) { ax1 = 0; ax2 = nx - 1; }
+  if (ay2 < ay1) { ay1 = 0; ay2 = ny - 1; }
+
+  *x1 = ax1; *x2 = ax2; *y1 = ay1; *y2 = ay2;
+}
+
+// Robust median + MAD on a ROI (0-based inclusive bounds), using subsample stride
+static void robust_median_mad_roi(const float* img, long nx, long ny,
+                                  long x1, long x2, long y1, long y2,
+                                  double* med_out, double* sigma_out)
+{
+  if (x1 < 0) x1 = 0;
+  if (y1 < 0) y1 = 0;
+  if (x2 > nx - 1) x2 = nx - 1;
+  if (y2 > ny - 1) y2 = ny - 1;
+
+  long wx = x2 - x1 + 1;
+  long wy = y2 - y1 + 1;
+  if (wx <= 0 || wy <= 0) {
+    *med_out = 0.0;
+    *sigma_out = 1.0;
+    return;
+  }
+
+  long Nroi = wx * wy;
   long target = 200000;
-  long stride = (N > target) ? (N / target) : 1;
+  long stride = (Nroi > target) ? (Nroi / target) : 1;
   if (stride < 1) stride = 1;
 
-  long ns = (N + stride - 1) / stride;
+  long ns = (Nroi + stride - 1) / stride;
   float* sample = (float*)malloc((size_t)ns * sizeof(float));
   if (!sample) die("malloc sample failed");
 
   long k = 0;
-  for (long i = 0; i < N; i += stride) sample[k++] = img[i];
+  long idx = 0;
+  for (long y = y1; y <= y2; y++) {
+    long row0 = y * nx;
+    for (long x = x1; x <= x2; x++, idx++) {
+      if ((idx % stride) == 0) sample[k++] = img[row0 + x];
+    }
+  }
   ns = k;
+
+  if (ns < 16) {
+    free(sample);
+    *med_out = 0.0;
+    *sigma_out = 1.0;
+    return;
+  }
 
   qsort(sample, (size_t)ns, sizeof(float), cmp_float);
   double med = (ns % 2) ? sample[ns/2] : 0.5*(sample[ns/2 - 1] + sample[ns/2]);
@@ -347,23 +444,58 @@ static Detection detect_star_near_goal(const float* img, long nx, long ny, const
   Detection d;
   memset(&d, 0, sizeof(d));
 
-  double med=0, sigma=0;
-  robust_median_mad(img, nx, ny, &med, &sigma);
+  // Background stats ROI
+  long bgx1, bgx2, bgy1, bgy2;
+  compute_roi_0based(nx, ny, p->pixel_origin,
+                     p->bg_roi_mask, p->bg_x1, p->bg_x2, p->bg_y1, p->bg_y2,
+                     &bgx1, &bgx2, &bgy1, &bgy2);
 
+  double med=0, sigma=0;
+  robust_median_mad_roi(img, nx, ny, bgx1, bgx2, bgy1, bgy2, &med, &sigma);
   const double thr = med + p->snr_thresh * sigma;
+
+  // Search ROI (defaults to bg ROI if not set)
+  long sx1, sx2, sy1, sy2;
+  if (p->search_roi_mask == 0) {
+    sx1 = bgx1; sx2 = bgx2; sy1 = bgy1; sy2 = bgy2;
+  } else {
+    compute_roi_0based(nx, ny, p->pixel_origin,
+                       p->search_roi_mask, p->search_x1, p->search_x2, p->search_y1, p->search_y2,
+                       &sx1, &sx2, &sy1, &sy2);
+  }
+
+  d.bkg = med;
+  d.sigma = sigma;
 
   const double goal_x0 = (p->pixel_origin == 0) ? p->goal_x : (p->goal_x - 1.0);
   const double goal_y0 = (p->pixel_origin == 0) ? p->goal_y : (p->goal_y - 1.0);
 
+  // Candidate search box around goal
   long x0 = (long)floor(goal_x0 - p->max_dist_pix);
   long x1 = (long)ceil (goal_x0 + p->max_dist_pix);
   long y0 = (long)floor(goal_y0 - p->max_dist_pix);
   long y1 = (long)ceil (goal_y0 + p->max_dist_pix);
 
-  if (x0 < 1) x0 = 1;
-  if (y0 < 1) y0 = 1;
-  if (x1 > nx-2) x1 = nx-2;
-  if (y1 > ny-2) y1 = ny-2;
+  // Restrict to search ROI AND keep 1-pixel margin for 3x3 neighborhood
+  long min_x = sx1 + 1;
+  long max_x = sx2 - 1;
+  long min_y = sy1 + 1;
+  long max_y = sy2 - 1;
+
+  if (min_x < 1) min_x = 1;
+  if (min_y < 1) min_y = 1;
+  if (max_x > nx - 2) max_x = nx - 2;
+  if (max_y > ny - 2) max_y = ny - 2;
+
+  if (x0 < min_x) x0 = min_x;
+  if (y0 < min_y) y0 = min_y;
+  if (x1 > max_x) x1 = max_x;
+  if (y1 > max_y) y1 = max_y;
+
+  if (x1 <= x0 || y1 <= y0) {
+    d.found = 0;
+    return d;
+  }
 
   double best_val = -1e300;
   long best_x = -1, best_y = -1;
@@ -410,9 +542,6 @@ static Detection detect_star_near_goal(const float* img, long nx, long ny, const
     }
   }
 
-  d.bkg = med;
-  d.sigma = sigma;
-
   if (best_x < 0) {
     d.found = 0;
     return d;
@@ -422,12 +551,17 @@ static Detection detect_star_near_goal(const float* img, long nx, long ny, const
   d.peak = best_val;
   d.snr = best_snr;
 
-  // centroid in window
+  // centroid in window (clamped to the search ROI)
   int hw = p->centroid_halfwin;
   long cx0 = best_x - hw; if (cx0 < 0) cx0 = 0;
   long cx1 = best_x + hw; if (cx1 > nx-1) cx1 = nx-1;
   long cy0 = best_y - hw; if (cy0 < 0) cy0 = 0;
   long cy1 = best_y + hw; if (cy1 > ny-1) cy1 = ny-1;
+
+  if (cx0 < sx1) cx0 = sx1;
+  if (cx1 > sx2) cx1 = sx2;
+  if (cy0 < sy1) cy0 = sy1;
+  if (cy1 > sy2) cy1 = sy2;
 
   double sumI = 0, sumX = 0, sumY = 0;
   for (long y = cy0; y <= cy1; y++) {
@@ -540,7 +674,7 @@ static void usage(const char* argv0) {
     "PATH can be a directory (polling mode) or a FITS file (one-shot mode).\n"
     "Back-compat: --dir PATH works too.\n"
     "Options:\n"
-    "  --pixel-origin 0|1      Pixel origin for goal and centroid (default 0)\n"
+    "  --pixel-origin 0|1      Pixel origin for goal/ROI/centroid (default 0)\n"
     "  --max-dist PIX          Search radius around goal (default 200)\n"
     "  --tol PIX               Success tolerance radius (default 0.5)\n"
     "  --snr S                 SNR threshold (default 8)\n"
@@ -551,7 +685,15 @@ static void usage(const char* argv0) {
     "  --extnum N              Fallback HDU (0=primary, 1=first ext...) (default 1)\n"
     "  --poll-sec S            Poll interval seconds (directory mode) (default 1.0)\n"
     "  --dry-run 0|1           Do not call TCS (default 0)\n"
-    "  --verbose 0|1           Verbose logging (default 1)\n",
+    "  --verbose 0|1           Verbose logging (default 1)\n"
+    "\n"
+    "  Background statistics ROI (inclusive bounds; same origin as goal):\n"
+    "    --bg-x1 N --bg-x2 N --bg-y1 N --bg-y2 N\n"
+    "    (aliases: --roi-x1/--roi-x2/--roi-y1/--roi-y2 set bg ROI)\n"
+    "\n"
+    "  Candidate search ROI (inclusive bounds; same origin as goal):\n"
+    "    --search-x1 N --search-x2 N --search-y1 N --search-y2 N\n"
+    "    If not provided, search ROI defaults to bg ROI.\n",
     argv0
   );
 }
@@ -574,6 +716,12 @@ static void set_defaults(AcqParams* p) {
 
   snprintf(p->extname, sizeof(p->extname), "L");
   p->extnum = 1;
+
+  p->bg_roi_mask = 0;
+  p->bg_x1 = p->bg_x2 = p->bg_y1 = p->bg_y2 = 0;
+
+  p->search_roi_mask = 0;
+  p->search_x1 = p->search_x2 = p->search_y1 = p->search_y2 = 0;
 
   p->poll_sec = 1.0;
   p->dry_run = 0;
@@ -615,6 +763,37 @@ static int parse_args(int argc, char** argv, AcqParams* p) {
       p->dry_run = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--verbose") && i+1 < argc) {
       p->verbose = atoi(argv[++i]);
+
+    // Background ROI flags
+    } else if (!strcmp(argv[i], "--bg-x1") && i+1 < argc) {
+      p->bg_x1 = atol(argv[++i]); p->bg_roi_mask |= ROI_X1_SET;
+    } else if (!strcmp(argv[i], "--bg-x2") && i+1 < argc) {
+      p->bg_x2 = atol(argv[++i]); p->bg_roi_mask |= ROI_X2_SET;
+    } else if (!strcmp(argv[i], "--bg-y1") && i+1 < argc) {
+      p->bg_y1 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y1_SET;
+    } else if (!strcmp(argv[i], "--bg-y2") && i+1 < argc) {
+      p->bg_y2 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y2_SET;
+
+    // Alias: --roi-* acts on background ROI (back-compat with earlier discussion)
+    } else if (!strcmp(argv[i], "--roi-x1") && i+1 < argc) {
+      p->bg_x1 = atol(argv[++i]); p->bg_roi_mask |= ROI_X1_SET;
+    } else if (!strcmp(argv[i], "--roi-x2") && i+1 < argc) {
+      p->bg_x2 = atol(argv[++i]); p->bg_roi_mask |= ROI_X2_SET;
+    } else if (!strcmp(argv[i], "--roi-y1") && i+1 < argc) {
+      p->bg_y1 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y1_SET;
+    } else if (!strcmp(argv[i], "--roi-y2") && i+1 < argc) {
+      p->bg_y2 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y2_SET;
+
+    // Search ROI flags
+    } else if (!strcmp(argv[i], "--search-x1") && i+1 < argc) {
+      p->search_x1 = atol(argv[++i]); p->search_roi_mask |= ROI_X1_SET;
+    } else if (!strcmp(argv[i], "--search-x2") && i+1 < argc) {
+      p->search_x2 = atol(argv[++i]); p->search_roi_mask |= ROI_X2_SET;
+    } else if (!strcmp(argv[i], "--search-y1") && i+1 < argc) {
+      p->search_y1 = atol(argv[++i]); p->search_roi_mask |= ROI_Y1_SET;
+    } else if (!strcmp(argv[i], "--search-y2") && i+1 < argc) {
+      p->search_y2 = atol(argv[++i]); p->search_roi_mask |= ROI_Y2_SET;
+
     } else if (!strcmp(argv[i], "--help")) {
       return 0;
     } else {
@@ -760,7 +939,7 @@ int main(int argc, char** argv)
       p.input, (p.oneshot ? "oneshot-file" : "dir-poll"),
       p.goal_x, p.goal_y, p.pixel_origin, p.max_dist_pix, p.tol_pix,
       p.snr_thresh, p.min_adjacent, p.centroid_halfwin,
-      (p.extname[0] ? p.extname : "(none)"), p.extnum, p.poll_sec
+            (p.extname[0] ? p.extname : "(none)"), p.extnum, p.poll_sec
     );
   }
 
@@ -772,12 +951,6 @@ int main(int argc, char** argv)
   // directory polling mode: iterate for max_iters frames
   for (int iter = 1; iter <= p.max_iters; iter++) {
     char path[PATH_MAX];
-
-    // wait for next FITS in directory
-    // (reuse previous polling helper)
-    // NOTE: simplest: inline call to wait_for_next_fits_poll
-    // (keeping it local here for clarity).
-    extern int wait_for_next_fits_poll(const char*, double, char*, size_t, int);
 
     int wrc = wait_for_next_fits_poll(p.dir, p.poll_sec, path, sizeof(path), p.verbose);
     if (wrc != 0) die("Failed waiting for next FITS (polling).");
