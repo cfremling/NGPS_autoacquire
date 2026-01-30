@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,-rpath,/home/developer/.local/lib CMakeFiles/ngps_acq.dir/src/ngps_acq.c.o -o ngps_acq  -Wl,-rpath,/usr/local/lib /usr/local/lib/libcfitsio.so -lwcs -lm -lm 

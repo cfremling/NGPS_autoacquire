@@ -1,0 +1,3 @@
+/home/developer/cfremling/NGPS_autoacquire/NGPS_autoacquire/build/CMakeFiles/rebuild_cache.dir
+/home/developer/cfremling/NGPS_autoacquire/NGPS_autoacquire/build/CMakeFiles/edit_cache.dir
+/home/developer/cfremling/NGPS_autoacquire/NGPS_autoacquire/build/CMakeFiles/ngps_acq.dir
