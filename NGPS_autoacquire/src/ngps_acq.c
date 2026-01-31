@@ -1,25 +1,30 @@
 // ngps_acq.c
-// NGPS acquisition helper for the slice-viewing camera.
+// NGPS acquisition / fine-acquire helper for the slice-viewing camera.
 //
-// Build:
+// Goals:
+//  - robust source detection + centroiding under poor seeing
+//  - robust statistics before issuing any TCS offset
+//  - reject duplicate frames and frames taken during/just after telescope motion
+//  - optional "manual" frame acquisition via:  scam framegrab one <path>
+//
+// Build (typical on NGPS machines):
 //   gcc -O3 -Wall -Wextra -std=c11 -o ngps_acq ngps_acq.c -lcfitsio -lwcs -lm
 //
-// One-shot (compute offsets, optionally move once):
-//   ./ngps_acq --input /path/to/frame.fits --goal-x 512 --goal-y 512 --dry-run 1
+// Example (stream mode, file updated by camera):
+//   ./ngps_acq --input /tmp/slicecam.fits --goal-x 512 --goal-y 512 --loop 1 \
+//              --bg-x1 50 --bg-x2 950 --bg-y1 30 --bg-y2 980 --debug 1
 //
-// Closed-loop acquisition:
-//   ./ngps_acq --input /path/to/live.fits --goal-x 512 --goal-y 512 --loop 1
+// Example (manual framegrab mode, synchronous):
+//   ./ngps_acq --frame-mode framegrab --framegrab-out /tmp/ngps_acq.fits \
+//              --goal-x 512 --goal-y 512 --loop 1
 //
 // Notes:
-//  - This program assumes the camera writes/overwrites the same FITS file.
-//  - Star detection and centroiding are designed to be robust under poor seeing.
-//  - Offsets returned are in arcsec and intended for:  tcs native pt <dra> <ddec>
-//
-// Diagnostics:
-//  - Use --debug 1 to write a PPM overlay of the background ROI:
-//      * thresholded pixels colored
-//      * peak circle, centroid +, goal x, arrow to goal
-//
+//  - TCS command assumed:  tcs native pt <dra> <ddec>
+//  - We set native units (dra/ddec arcsec) once per run by default.
+//  - Commanded offsets are computed as (star - goal) (arcsec), i.e. the move
+//    that should place the star on the goal pixel. If your TCS sign convention
+//    is opposite, set --tcs-sign -1.
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,8 +40,19 @@
 #include <limits.h>
 
 #include "fitsio.h"
-#include <wcslib/wcs.h>
-#include <wcslib/wcshdr.h>
+
+#ifdef __has_include
+#  if __has_include(<wcslib/wcs.h>)
+#    include <wcslib/wcs.h>
+#    include <wcslib/wcshdr.h>
+#  else
+#    include <wcs.h>
+#    include <wcshdr.h>
+#  endif
+#else
+#  include <wcslib/wcs.h>
+#  include <wcslib/wcshdr.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -48,62 +64,77 @@
 #define ROI_Y1_SET 0x04
 #define ROI_Y2_SET 0x08
 
+typedef enum {
+  FRAME_STREAM = 0,
+  FRAME_FRAMEGRAB = 1
+} FrameMode;
+
 typedef struct {
-  char   input[PATH_MAX];
+  char   input[PATH_MAX];        // stream file path
+
+  FrameMode frame_mode;
+  char   framegrab_out[PATH_MAX];
+  int    framegrab_use_tmp;      // if 1: write to framegrab_out then atomically rename
 
   double goal_x;
   double goal_y;
-  int    pixel_origin;        // 0 or 1
+  int    pixel_origin;           // 0 or 1
 
-  // search constraints
-  double max_dist_pix;        // circular cut around goal
-  double snr_thresh;          // detection threshold in sigma
-  int    min_adjacent;        // raw-pixel neighbors above threshold
+  // Candidate search constraints
+  double max_dist_pix;           // circular cut around goal (pix)
+  double snr_thresh;             // detection threshold (sigma)
+  int    min_adjacent;           // raw-pixel neighbors above raw threshold
 
-  // detection filter
-  double filt_sigma_pix;      // Gaussian sigma for smoothing (pix)
+  // Filtering for detection
+  double filt_sigma_pix;         // Gaussian sigma for smoothing (pix)
 
-  // centroiding
-  int    centroid_halfwin;    // window half-width (pix)
-  double centroid_sigma_pix;  // Gaussian window sigma (pix)
+  // Centroiding
+  int    centroid_halfwin;       // window half-width (pix)
+  double centroid_sigma_pix;     // Gaussian window sigma (pix)
   int    centroid_maxiter;
   double centroid_eps_pix;
 
   // FITS selection
-  int    extnum;              // fallback: 0=primary, 1=first extension
-  char   extname[32];         // preferred EXTNAME ("L" default). "none" disables.
+  int    extnum;                 // 0=primary, 1=first extension, ...
+  char   extname[32];            // preferred EXTNAME, empty disables
 
-  // Background statistics ROI (typically the illuminated / on-sky region)
+  // Background statistics ROI (inclusive; user origin)
   int    bg_roi_mask;
-  long   bg_x1, bg_x2;
-  long   bg_y1, bg_y2;
+  long   bg_x1, bg_x2, bg_y1, bg_y2;
 
-  // Candidate search ROI (defaults to bg ROI if unset)
+  // Candidate search ROI (inclusive; user origin)
   int    search_roi_mask;
-  long   search_x1, search_x2;
-  long   search_y1, search_y2;
+  long   search_x1, search_x2, search_y1, search_y2;
 
-  // Closed-loop wrapper
+  // Closed-loop / guiding wrapper
   int    loop;
-  double cadence_sec;         // seconds between accepted samples
-  int    max_samples;         // per-move gather
-  int    min_samples;         // minimum before testing precision
-  double prec_arcsec;         // required scatter (MAD->sigma) per axis
-  double goal_arcsec;         // convergence threshold on robust offset magnitude
-  int    max_cycles;          // max move cycles
-  double gain;                // multiply commanded move (0..1 recommended)
+  double cadence_sec;            // minimum seconds between accepted samples (stream mode)
+  int    max_samples;            // per-move gather (accepted samples)
+  int    min_samples;            // minimum before testing scatter
+  double prec_arcsec;            // required robust scatter (MAD->sigma) per axis
+  double goal_arcsec;            // convergence threshold on robust offset magnitude
+  int    max_cycles;             // number of move cycles
+  double gain;                   // gain applied to commanded move (0..1 recommended)
 
-  // WCS/offset conventions
-  int    dra_use_cosdec;      // 1: dra = dRA*cos(dec) (default); 0: dra = dRA
-  int    tcs_sign;            // multiply commanded offsets by +/-1
+  // Frame quality & safety
+  int    reject_identical;       // reject identical image signatures
+  int    reject_after_move;      // reject N new frames after any TCS move
+  double settle_sec;             // optional sleep after move (additional to rejecting frames)
+  double max_move_arcsec;        // safety cap; do not issue moves larger than this
+  int    continue_on_fail;       // if 0: exit on failure to build stats; if 1: keep trying
+
+  // Offset conventions
+  int    dra_use_cosdec;         // 1: dra = dRA*cos(dec)
+  int    tcs_sign;               // multiply commanded offsets by +/-1
 
   // TCS options
-  int    tcs_set_units;       // if 1: run "tcs native dra 'arcsec'" and "... ddec 'arcsec'" once
+  int    tcs_set_units;          // if 1: run "tcs native dra 'arcsec'" and "... ddec 'arcsec'" once
 
   // Debug
   int    debug;
   char   debug_out[PATH_MAX];
 
+  // General
   int    dry_run;
   int    verbose;
 } AcqParams;
@@ -111,29 +142,25 @@ typedef struct {
 typedef struct {
   int    found;
   // peak in pixel coords (user origin)
-  double peak_x;
-  double peak_y;
-  // windowed centroid (user origin)
-  double cx;
-  double cy;
-
+  double peak_x, peak_y;
+  // centroid (user origin)
+  double cx, cy;
+  // quality
   double peak_val;
   double peak_snr_raw;
-  double snr_ap;      // aperture-like SNR within centroid window
-
+  double snr_ap;
   double bkg;
   double sigma;
-
-  // For debug
-  long   cand_x0, cand_y0; // 0-based
-  long   cand_x1, cand_y1;
+  // debug ROI bounds (0-based inclusive)
+  long   rx1, rx2, ry1, ry2;     // stats ROI
+  long   sx1, sx2, sy1, sy2;     // search ROI
 } Detection;
 
 typedef struct {
   int    ok;
   Detection det;
 
-  // pixel offsets
+  // Pixel offsets star - goal (pix)
   double dx_pix;
   double dy_pix;
 
@@ -147,6 +174,14 @@ typedef struct {
   double ddec_cmd_arcsec;
   double r_cmd_arcsec;
 } FrameResult;
+
+typedef struct {
+  time_t mtime;
+  off_t  size;
+  uint64_t sig;        // image signature (subsampled)
+  int have_sig;
+  struct timespec t_accept; // time we accepted this frame
+} FrameState;
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
@@ -162,6 +197,12 @@ static void sleep_seconds(double sec) {
   ts.tv_sec  = (time_t)floor(sec);
   ts.tv_nsec = (long)((sec - (double)ts.tv_sec) * 1e9);
   while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+}
+
+static double now_monotonic_sec(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + 1e-9*(double)ts.tv_nsec;
 }
 
 static int cmp_float(const void* a, const void* b) {
@@ -182,7 +223,7 @@ static double wrap_dra_deg(double dra) {
   return dra;
 }
 
-// Convert a user-specified ROI (mask + bounds in user origin) into clamped 0-based inclusive bounds.
+// Convert a user-specified ROI into clamped 0-based inclusive bounds.
 // If mask is 0, returns full-frame bounds.
 static void compute_roi_0based(long nx, long ny, int pixel_origin,
                                int mask, long ux1_in, long ux2_in, long uy1_in, long uy2_in,
@@ -215,7 +256,7 @@ static void compute_roi_0based(long nx, long ny, int pixel_origin,
   *x1=ax1; *x2=ax2; *y1=ay1; *y2=ay2;
 }
 
-// Subsample pixels in ROI into a float array. Returns allocated array and count.
+// Subsample pixels in ROI into a float array.
 static float* roi_subsample(const float* img, long nx, long ny,
                             long x1, long x2, long y1, long y2,
                             long target, long* n_out)
@@ -250,10 +291,10 @@ static float* roi_subsample(const float* img, long nx, long ny,
   return sample;
 }
 
-// SExtractor-like global background + sigma estimation within ROI:
+// SExtractor-like background + sigma estimation within ROI:
 //  - initial median + MAD
 //  - iterative sigma-clipping around median
-//  - background estimate via mode = 2.5*median - 1.5*mean, unless (mean-median)/sigma > 0.3 => use median
+//  - background via mode = 2.5*median - 1.5*mean (unless skewed, then median)
 static void bg_sigma_sextractor_like(const float* img, long nx, long ny,
                                      long x1, long x2, long y1, long y2,
                                      double* bkg_out, double* sigma_out)
@@ -282,7 +323,7 @@ static void bg_sigma_sextractor_like(const float* img, long nx, long ny,
   double sigma = 1.4826 * mad;
   if (!isfinite(sigma) || sigma <= 0) sigma = 1.0;
 
-  // Iterative clip around median
+  // Iterative clip
   const double clip = 3.0;
   double mean = median;
   double sigma_prev = sigma;
@@ -312,12 +353,10 @@ static void bg_sigma_sextractor_like(const float* img, long nx, long ny,
     if (rel < 0.01) break;
   }
 
-  // Mode estimator; fallback to median if strongly skewed
   double mode = 2.5*median - 1.5*mean;
   double bkg = mode;
   if (sigma > 0 && (mean - median)/sigma > 0.3) bkg = median;
   if (!isfinite(bkg)) bkg = median;
-
   if (!isfinite(sigma) || sigma <= 0) sigma = 1.0;
 
   *bkg_out = bkg;
@@ -345,7 +384,7 @@ static double mad_sigma_of_doubles(const double* a_in, int n, double med)
   return 1.4826 * mad;
 }
 
-// Gaussian kernel (1D) normalized to sum=1. Returns pointer and radius.
+// Gaussian kernel (1D) normalized to sum=1.
 static double* make_gaussian_kernel(double sigma, int* radius_out)
 {
   if (sigma <= 0.2) sigma = 0.2;
@@ -377,11 +416,11 @@ static double kernel_sum_sq(const double* k, int radius)
   return s2;
 }
 
-// Separable convolution on a patch (width w, height h) with 1D kernel k (radius r).
-// Input and output are float arrays length w*h. Border handling: clamp.
-static void convolve_separable(const float* in, float* tmp, float* out, int w, int h, const double* k, int r)
+// Separable convolution on a patch (w*h). Border handling: clamp.
+static void convolve_separable(const float* in, float* tmp, float* out,
+                               int w, int h, const double* k, int r)
 {
-  // horizontal into tmp
+  // horizontal
   for (int y = 0; y < h; y++) {
     const float* row = in + y*w;
     float* trow = tmp + y*w;
@@ -397,7 +436,7 @@ static void convolve_separable(const float* in, float* tmp, float* out, int w, i
     }
   }
 
-  // vertical into out
+  // vertical
   for (int y = 0; y < h; y++) {
     float* orow = out + y*w;
     for (int x = 0; x < w; x++) {
@@ -413,7 +452,7 @@ static void convolve_separable(const float* in, float* tmp, float* out, int w, i
   }
 }
 
-// Draw helpers for debug PPM
+// Simple debug drawing (PPM)
 static void set_px(uint8_t* rgb, int w, int h, int x, int y, uint8_t r, uint8_t g, uint8_t b)
 {
   if (x < 0 || y < 0 || x >= w || y >= h) return;
@@ -439,7 +478,6 @@ static void draw_x(uint8_t* rgb, int w, int h, int x, int y, int rad, uint8_t r,
 
 static void draw_circle(uint8_t* rgb, int w, int h, int xc, int yc, int rad, uint8_t r, uint8_t g, uint8_t b)
 {
-  // simple midpoint-ish sampling
   int x = rad;
   int y = 0;
   int err = 0;
@@ -479,10 +517,9 @@ static void draw_line(uint8_t* rgb, int w, int h, int x0, int y0, int x1, int y1
 static void draw_arrow(uint8_t* rgb, int w, int h, int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
 {
   draw_line(rgb,w,h,x0,y0,x1,y1,r,g,b);
-  // arrowhead
   double ang = atan2((double)(y1 - y0), (double)(x1 - x0));
-  double a1 = ang + 3.141592653589793/8.0;
-  double a2 = ang - 3.141592653589793/8.0;
+  double a1 = ang + M_PI/8.0;
+  double a2 = ang - M_PI/8.0;
   int L = 10;
   int hx1 = x1 - (int)lround(L * cos(a1));
   int hy1 = y1 - (int)lround(L * sin(a1));
@@ -493,7 +530,7 @@ static void draw_arrow(uint8_t* rgb, int w, int h, int x0, int y0, int x1, int y
 }
 
 static int write_debug_ppm(const char* outpath,
-                           const float* img, long nx, long ny,
+                           const float* img, long nx,
                            long rx1, long rx2, long ry1, long ry2,
                            double bkg, double sigma, double snr_thresh,
                            const Detection* det,
@@ -506,7 +543,6 @@ static int write_debug_ppm(const char* outpath,
   uint8_t* rgb = (uint8_t*)malloc((size_t)w * (size_t)h * 3);
   if (!rgb) return 2;
 
-  // Scale: use [bkg-2*sigma, bkg+6*sigma]
   double vmin = bkg - 2.0*sigma;
   double vmax = bkg + 6.0*sigma;
   double inv = (vmax > vmin) ? (1.0/(vmax - vmin)) : 1.0;
@@ -524,56 +560,50 @@ static int write_debug_ppm(const char* outpath,
       rgb[idx+0] = g;
       rgb[idx+1] = g;
       rgb[idx+2] = g;
-    }
-  }
 
-  // Color pixels above threshold
-  double thr = bkg + snr_thresh * sigma;
-  for (int yy = 0; yy < h; yy++) {
-    long y = ry1 + yy;
-    for (int xx = 0; xx < w; xx++) {
-      long x = rx1 + xx;
-      double v = img[y*nx + x];
-      if (v > thr) {
-        set_px(rgb, w, h, xx, yy, 255, 80, 80);
+      double snr = (sigma > 0) ? ((v - bkg) / sigma) : 0;
+      if (snr >= snr_thresh) {
+        // color above-threshold pixels (cyan-ish)
+        rgb[idx+0] = (uint8_t)((int)rgb[idx+0] / 2);
+        rgb[idx+1] = 255;
+        rgb[idx+2] = 255;
       }
     }
   }
 
-  // Overlay markers if found
   if (det && det->found) {
-    double gx0 = (p->pixel_origin == 0) ? p->goal_x : (p->goal_x - 1.0);
-    double gy0 = (p->pixel_origin == 0) ? p->goal_y : (p->goal_y - 1.0);
+    int px0 = (p->pixel_origin == 0) ? (int)lround(det->peak_x) : (int)lround(det->peak_x - 1.0);
+    int py0 = (p->pixel_origin == 0) ? (int)lround(det->peak_y) : (int)lround(det->peak_y - 1.0);
+    int cx0 = (p->pixel_origin == 0) ? (int)lround(det->cx)     : (int)lround(det->cx - 1.0);
+    int cy0 = (p->pixel_origin == 0) ? (int)lround(det->cy)     : (int)lround(det->cy - 1.0);
 
-    // convert user->0based for plotting
-    double cx0 = (p->pixel_origin == 0) ? det->cx : (det->cx - 1.0);
-    double cy0 = (p->pixel_origin == 0) ? det->cy : (det->cy - 1.0);
-    double px0 = (p->pixel_origin == 0) ? det->peak_x : (det->peak_x - 1.0);
-    double py0 = (p->pixel_origin == 0) ? det->peak_y : (det->peak_y - 1.0);
+    int gx0 = (p->pixel_origin == 0) ? (int)lround(p->goal_x)   : (int)lround(p->goal_x - 1.0);
+    int gy0 = (p->pixel_origin == 0) ? (int)lround(p->goal_y)   : (int)lround(p->goal_y - 1.0);
 
-    int gx = (int)lround(gx0 - (double)rx1);
-    int gy = (int)lround(gy0 - (double)ry1);
-    int cx = (int)lround(cx0 - (double)rx1);
-    int cy = (int)lround(cy0 - (double)ry1);
-    int px = (int)lround(px0 - (double)rx1);
-    int py = (int)lround(py0 - (double)ry1);
+    // shift into ROI image coordinates
+    int px = px0 - (int)rx1;
+    int py = py0 - (int)ry1;
+    int cx = cx0 - (int)rx1;
+    int cy = cy0 - (int)ry1;
+    int gx = gx0 - (int)rx1;
+    int gy = gy0 - (int)ry1;
 
-    draw_x(rgb, w, h, gx, gy, 9, 40, 200, 255);
-    draw_circle(rgb, w, h, px, py, 12, 255, 220, 40);
-    draw_plus(rgb, w, h, cx, cy, 9, 40, 255, 80);
-    draw_arrow(rgb, w, h, cx, cy, gx, gy, 255, 255, 255);
+    draw_circle(rgb, w, h, px, py, 10, 255, 50, 50);
+    draw_plus(rgb,   w, h, cx, cy, 6,  50, 255, 50);
+    draw_x(rgb,      w, h, gx, gy, 8,  255, 255, 0);
+    draw_arrow(rgb,  w, h, cx, cy, gx, gy, 255, 200, 0);
   }
 
-  FILE* fp = fopen(outpath, "wb");
-  if (!fp) { free(rgb); return 3; }
-  fprintf(fp, "P6\n%d %d\n255\n", w, h);
-  fwrite(rgb, 1, (size_t)w * (size_t)h * 3, fp);
-  fclose(fp);
+  FILE* f = fopen(outpath, "wb");
+  if (!f) { free(rgb); return 3; }
+  fprintf(f, "P6\n%d %d\n255\n", w, h);
+  fwrite(rgb, 1, (size_t)w*(size_t)h*3, f);
+  fclose(f);
   free(rgb);
   return 0;
 }
 
-// Move to IMAGE HDU by EXTNAME match. Returns 0 on success.
+// --- FITS I/O helpers ---
 static int move_to_image_hdu_by_extname(fitsfile* fptr, const char* want_extname, int* out_hdu_index, int* status)
 {
   if (!want_extname || want_extname[0] == '\0') return 1;
@@ -601,22 +631,25 @@ static int move_to_image_hdu_by_extname(fitsfile* fptr, const char* want_extname
   return 4;
 }
 
-// Read 2D float image + header string from preferred EXTNAME (if set), else extnum.
 static int read_fits_image_and_header(const char* path, const AcqParams* p,
                                       float** img_out, long* nx_out, long* ny_out,
-                                      char** header_out, int* nkeys_out)
+                                      char** header_out, int* nkeys_out,
+                                      int* used_hdu_out, char* used_extname_out, size_t used_extname_sz)
 {
   fitsfile* fptr = NULL;
   int status = 0;
 
   if (fits_open_file(&fptr, path, READONLY, &status)) return status;
 
-  // Choose HDU
+  int used_hdu = 1;
+  char used_extname[FLEN_VALUE] = {0};
+
+  // Prefer EXTNAME
   if (p->extname[0]) {
     int found_hdu = 0;
     int rc = move_to_image_hdu_by_extname(fptr, p->extname, &found_hdu, &status);
     if (rc == 0) {
-      // already moved
+      used_hdu = found_hdu;
     } else {
       if (p->verbose) fprintf(stderr, "WARNING: EXTNAME='%s' not found; falling back to extnum=%d\n", p->extname, p->extnum);
       status = 0;
@@ -625,12 +658,22 @@ static int read_fits_image_and_header(const char* path, const AcqParams* p,
         fits_close_file(fptr, &status);
         return status;
       }
+      used_hdu = p->extnum + 1;
     }
   } else {
     int hdutype = 0;
     if (fits_movabs_hdu(fptr, p->extnum + 1, &hdutype, &status)) {
       fits_close_file(fptr, &status);
       return status;
+    }
+    used_hdu = p->extnum + 1;
+  }
+
+  // record EXTNAME
+  {
+    int keystat = 0;
+    if (fits_read_key(fptr, TSTRING, "EXTNAME", used_extname, NULL, &keystat)) {
+      used_extname[0] = '\0';
     }
   }
 
@@ -674,19 +717,21 @@ static int read_fits_image_and_header(const char* path, const AcqParams* p,
   fits_close_file(fptr, &status);
 
   *img_out = img;
-  *nx_out = nx;
-  *ny_out = ny;
+  *nx_out  = nx;
+  *ny_out  = ny;
   *header_out = header;
-  *nkeys_out = nkeys;
+  *nkeys_out  = nkeys;
+  if (used_hdu_out) *used_hdu_out = used_hdu;
+  if (used_extname_out && used_extname_sz > 0) {
+    snprintf(used_extname_out, used_extname_sz, "%s", used_extname);
+  }
+
   return 0;
 }
 
-// Init WCS from header string. Caller must wcsvfree(&nwcs, &wcs).
-static int init_wcs_from_header(const char* header, int nkeys,
-                                struct wcsprm** wcs_out, int* nwcs_out)
+// --- WCS helpers ---
+static int init_wcs_from_header(const char* header, int nkeys, struct wcsprm** wcs_out, int* nwcs_out)
 {
-  *wcs_out = NULL;
-  *nwcs_out = 0;
   if (!header || nkeys <= 0) return 1;
 
   int relax = WCSHDR_all;
@@ -727,14 +772,77 @@ static int pix2world_wcs(const struct wcsprm* wcs0, double pix_x, double pix_y,
   return 0;
 }
 
-// Execute a TCS move (dra,ddec in arcsec).
-static int tcs_move_arcsec(double dra_arcsec, double ddec_arcsec, const AcqParams* p)
+// --- Frame signature (reject identical) ---
+static uint64_t fnv1a64_init(void) { return 1469598103934665603ULL; }
+static uint64_t fnv1a64_step(uint64_t h, uint64_t x) {
+  h ^= x;
+  return h * 1099511628211ULL;
+}
+
+static uint64_t image_signature_subsample(const float* img, long nx, long ny,
+                                          long x1, long x2, long y1, long y2)
+{
+  if (!img || nx <= 0 || ny <= 0) return 0;
+  if (x1 < 0) x1 = 0;
+  if (y1 < 0) y1 = 0;
+  if (x2 > nx-1) x2 = nx-1;
+  if (y2 > ny-1) y2 = ny-1;
+  if (x2 < x1 || y2 < y1) return 0;
+
+  long wx = x2 - x1 + 1;
+  long wy = y2 - y1 + 1;
+  long N = wx * wy;
+
+  // Aim for ~50k samples max.
+  long target = 50000;
+  long stride = (N > target) ? (N / target) : 1;
+  if (stride < 1) stride = 1;
+
+  uint64_t h = fnv1a64_init();
+  long idx = 0;
+  for (long y = y1; y <= y2; y++) {
+    long row0 = y * nx;
+    for (long x = x1; x <= x2; x++, idx++) {
+      if ((idx % stride) != 0) continue;
+      // quantize float to int32 with mild scaling to be stable
+      float v = img[row0 + x];
+      int32_t q = (int32_t)lrintf(v * 8.0f);
+      h = fnv1a64_step(h, (uint64_t)(uint32_t)q);
+    }
+  }
+  // Mix in ROI bounds to reduce accidental collisions
+  h = fnv1a64_step(h, (uint64_t)(uint32_t)x1);
+  h = fnv1a64_step(h, (uint64_t)(uint32_t)y1);
+  h = fnv1a64_step(h, (uint64_t)(uint32_t)x2);
+  h = fnv1a64_step(h, (uint64_t)(uint32_t)y2);
+  return h;
+}
+
+// --- TCS helpers ---
+static int tcs_set_native_units(int dry_run, int verbose)
+{
+  const char* cmd1 = "tcs native dra 'arcsec'";
+  const char* cmd2 = "tcs native ddec 'arcsec'";
+  if (verbose || dry_run) {
+    fprintf(stderr, "TCS CMD: %s\n", cmd1);
+    fprintf(stderr, "TCS CMD: %s\n", cmd2);
+  }
+  if (dry_run) return 0;
+  int rc1 = system(cmd1);
+  int rc2 = system(cmd2);
+  if (rc1 != 0 || rc2 != 0) {
+    fprintf(stderr, "WARNING: TCS unit command failed rc1=%d rc2=%d\n", rc1, rc2);
+    return 1;
+  }
+  return 0;
+}
+
+static int tcs_move_arcsec(double dra_arcsec, double ddec_arcsec, int dry_run, int verbose)
 {
   char cmd[512];
   snprintf(cmd, sizeof(cmd), "tcs native pt %.3f %.3f", dra_arcsec, ddec_arcsec);
-
-  if (p->verbose || p->dry_run) fprintf(stderr, "TCS CMD: %s\n", cmd);
-  if (p->dry_run) return 0;
+  if (verbose || dry_run) fprintf(stderr, "TCS CMD: %s\n", cmd);
+  if (dry_run) return 0;
 
   int rc = system(cmd);
   if (rc != 0) {
@@ -744,492 +852,472 @@ static int tcs_move_arcsec(double dra_arcsec, double ddec_arcsec, const AcqParam
   return 0;
 }
 
-static int tcs_set_units_once(const AcqParams* p)
+// --- Camera command helpers ---
+static int scam_framegrab_one(const char* outpath, int verbose)
 {
-  if (!p->tcs_set_units) return 0;
-  const char* cmd1 = "tcs native dra 'arcsec'";
-  const char* cmd2 = "tcs native ddec 'arcsec'";
-  if (p->verbose || p->dry_run) {
-    fprintf(stderr, "TCS SET: %s\n", cmd1);
-    fprintf(stderr, "TCS SET: %s\n", cmd2);
+  char cmd[PATH_MAX + 128];
+  // We assume scam writes the file atomically enough; if not, stream stability check handles it.
+  snprintf(cmd, sizeof(cmd), "scam framegrab one %s", outpath);
+  if (verbose) fprintf(stderr, "CAM CMD: %s\n", cmd);
+  int rc = system(cmd);
+  if (rc != 0) {
+    fprintf(stderr, "WARNING: framegrab command failed (rc=%d)\n", rc);
+    return 1;
   }
-  if (p->dry_run) return 0;
-  (void)system(cmd1);
-  (void)system(cmd2);
   return 0;
 }
 
-// Iterative Gaussian-windowed centroid around a starting point.
-static void windowed_centroid(const float* img, long nx, long ny,
-                              long sx1, long sx2, long sy1, long sy2,
-                              double bkg, int hw, double sigma_w,
-                              int maxiter, double eps,
-                              double x_start, double y_start,
-                              double* x_out, double* y_out,
-                              double* flux_out, int* npixpos_out)
-{
-  double xc = x_start;
-  double yc = y_start;
-  if (sigma_w <= 0.2) sigma_w = 0.2;
-
-  for (int it = 0; it < maxiter; it++) {
-    long x0 = (long)floor(xc) - hw;
-    long x1 = (long)floor(xc) + hw;
-    long y0 = (long)floor(yc) - hw;
-    long y1 = (long)floor(yc) + hw;
-
-    if (x0 < sx1) x0 = sx1;
-    if (y0 < sy1) y0 = sy1;
-    if (x1 > sx2) x1 = sx2;
-    if (y1 > sy2) y1 = sy2;
-
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > nx-1) x1 = nx-1;
-    if (y1 > ny-1) y1 = ny-1;
-
-    double sumW = 0.0, sumX = 0.0, sumY = 0.0;
-    double flux = 0.0;
-    int np = 0;
-
-    for (long y = y0; y <= y1; y++) {
-      for (long x = x0; x <= x1; x++) {
-        double I = (double)img[y*nx + x] - bkg;
-        if (I <= 0) continue;
-        double dx = ((double)x - xc);
-        double dy = ((double)y - yc);
-        double w = exp(-0.5*(dx*dx + dy*dy)/(sigma_w*sigma_w));
-        double ww = w * I;
-        sumW += ww;
-        sumX += ww * (double)x;
-        sumY += ww * (double)y;
-        flux += I;
-        np++;
-      }
-    }
-
-    if (sumW <= 0.0) break;
-
-    double xn = sumX / sumW;
-    double yn = sumY / sumW;
-    double sh = hypot(xn - xc, yn - yc);
-    xc = xn;
-    yc = yn;
-
-    if (it == maxiter-1 || sh < eps) {
-      if (flux_out) *flux_out = flux;
-      if (npixpos_out) *npixpos_out = np;
-      break;
-    }
-
-    if (flux_out) *flux_out = flux;
-    if (npixpos_out) *npixpos_out = np;
-  }
-
-  *x_out = xc;
-  *y_out = yc;
-}
-
-// Robust star detection near goal.
-static Detection detect_star(const float* img, long nx, long ny, const AcqParams* p)
+// --- Detection + centroiding ---
+static Detection detect_star_near_goal(const float* img, long nx, long ny, const AcqParams* p)
 {
   Detection d;
   memset(&d, 0, sizeof(d));
 
-  // Background stats ROI
-  long bgx1, bgx2, bgy1, bgy2;
+  // Stats ROI
   compute_roi_0based(nx, ny, p->pixel_origin,
                      p->bg_roi_mask, p->bg_x1, p->bg_x2, p->bg_y1, p->bg_y2,
-                     &bgx1, &bgx2, &bgy1, &bgy2);
+                     &d.rx1, &d.rx2, &d.ry1, &d.ry2);
 
-  double bkg = 0.0, sigma = 1.0;
-  bg_sigma_sextractor_like(img, nx, ny, bgx1, bgx2, bgy1, bgy2, &bkg, &sigma);
-  if (!isfinite(sigma) || sigma <= 0) sigma = 1.0;
-
-  d.bkg = bkg;
-  d.sigma = sigma;
-
-  // Search ROI
-  long sx1, sx2, sy1, sy2;
+  // Search ROI (defaults to stats ROI)
   if (p->search_roi_mask == 0) {
-    sx1 = bgx1; sx2 = bgx2; sy1 = bgy1; sy2 = bgy2;
+    d.sx1 = d.rx1; d.sx2 = d.rx2; d.sy1 = d.ry1; d.sy2 = d.ry2;
   } else {
     compute_roi_0based(nx, ny, p->pixel_origin,
                        p->search_roi_mask, p->search_x1, p->search_x2, p->search_y1, p->search_y2,
-                       &sx1, &sx2, &sy1, &sy2);
+                       &d.sx1, &d.sx2, &d.sy1, &d.sy2);
   }
 
-  // Goal in 0-based pixels
-  const double goal_x0 = (p->pixel_origin == 0) ? p->goal_x : (p->goal_x - 1.0);
-  const double goal_y0 = (p->pixel_origin == 0) ? p->goal_y : (p->goal_y - 1.0);
-
-  // Candidate window (square) around goal
-  long x0 = (long)floor(goal_x0 - p->max_dist_pix);
-  long x1 = (long)ceil (goal_x0 + p->max_dist_pix);
-  long y0 = (long)floor(goal_y0 - p->max_dist_pix);
-  long y1 = (long)ceil (goal_y0 + p->max_dist_pix);
-
-  if (x0 < sx1) x0 = sx1;
-  if (x1 > sx2) x1 = sx2;
-  if (y0 < sy1) y0 = sy1;
-  if (y1 > sy2) y1 = sy2;
-
-  // Keep margins for local-max neighborhood checks
-  if (x0 < 1) x0 = 1;
-  if (y0 < 1) y0 = 1;
-  if (x1 > nx-2) x1 = nx-2;
-  if (y1 > ny-2) y1 = ny-2;
-
-  if (x1 <= x0 || y1 <= y0) {
+  // Background and sigma from stats ROI
+  bg_sigma_sextractor_like(img, nx, ny, d.rx1, d.rx2, d.ry1, d.ry2, &d.bkg, &d.sigma);
+  if (!isfinite(d.sigma) || d.sigma <= 0) {
     d.found = 0;
     return d;
   }
 
-  d.cand_x0 = x0;
-  d.cand_x1 = x1;
-  d.cand_y0 = y0;
-  d.cand_y1 = y1;
+  // Goal (0-based)
+  double goal_x0 = (p->pixel_origin == 0) ? p->goal_x : (p->goal_x - 1.0);
+  double goal_y0 = (p->pixel_origin == 0) ? p->goal_y : (p->goal_y - 1.0);
 
-  // Extract background-subtracted patch for filtering
-  int w = (int)(x1 - x0 + 1);
-  int h = (int)(y1 - y0 + 1);
-  float* patch = (float*)malloc((size_t)w * (size_t)h * sizeof(float));
-  float* tmp   = (float*)malloc((size_t)w * (size_t)h * sizeof(float));
-  float* filt  = (float*)malloc((size_t)w * (size_t)h * sizeof(float));
-  if (!patch || !tmp || !filt) die("malloc patch/filter failed");
+  // Build detection patch (search ROI) and background-subtract
+  int w = (int)(d.sx2 - d.sx1 + 1);
+  int h = (int)(d.sy2 - d.sy1 + 1);
+  if (w <= 3 || h <= 3) {
+    d.found = 0;
+    return d;
+  }
+
+  float* patch = (float*)malloc((size_t)w*(size_t)h*sizeof(float));
+  float* tmp   = (float*)malloc((size_t)w*(size_t)h*sizeof(float));
+  float* filt  = (float*)malloc((size_t)w*(size_t)h*sizeof(float));
+  if (!patch || !tmp || !filt) die("malloc patch/tmp/filt failed");
 
   for (int yy = 0; yy < h; yy++) {
-    long y = y0 + yy;
+    long y = d.sy1 + yy;
+    long row0 = y * nx;
+    float* prow = patch + (size_t)yy*(size_t)w;
     for (int xx = 0; xx < w; xx++) {
-      long x = x0 + xx;
-      patch[yy*w + xx] = (float)((double)img[y*nx + x] - bkg);
+      long x = d.sx1 + xx;
+      double v = (double)img[row0 + x] - d.bkg;
+      // keep negatives; filter uses them too
+      prow[xx] = (float)v;
     }
   }
 
+  // Filter for detection
   int kr = 0;
   double* k = make_gaussian_kernel(p->filt_sigma_pix, &kr);
-  double s2 = kernel_sum_sq(k, kr);
-  double sigma_filt = sigma * s2; // because sqrt(sum(w^2)) = s2 for separable normalized kernel
-
   convolve_separable(patch, tmp, filt, w, h, k, kr);
+  double sumsq1d = kernel_sum_sq(k, kr);
+  free(k);
 
-  double thr_f = p->snr_thresh * sigma_filt;
-  double thr_raw = bkg + p->snr_thresh * sigma;
+  // Detection threshold in filtered image
+  // For separable 2D kernel, sigma_filt = sigma_raw * sqrt(sum(K^2)) = sigma_raw * sumsq1d
+  double sigma_filt = d.sigma * sumsq1d;
+  if (!isfinite(sigma_filt) || sigma_filt <= 0) sigma_filt = d.sigma;
+  double thr_filt = p->snr_thresh * sigma_filt;
 
-  // Find best local maximum in filtered image
-  float best_v = -1e30f;
+  // Raw threshold for adjacency check
+  double thr_raw = p->snr_thresh * d.sigma;
+
+  // Search best local maximum
+  double best_val = -1e300;
   int best_x = -1, best_y = -1;
+  double best_snr_raw = 0;
+
   for (int yy = 1; yy < h-1; yy++) {
     for (int xx = 1; xx < w-1; xx++) {
-      float v = filt[yy*w + xx];
-      if (v <= (float)thr_f) continue;
+      float v = filt[(size_t)yy*(size_t)w + (size_t)xx];
+      if ((double)v < thr_filt) continue;
 
-      // local max in 3x3 (filtered)
-      int ismax = 1;
-      for (int dy = -1; dy <= 1 && ismax; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-          if (dx == 0 && dy == 0) continue;
-          if (filt[(yy+dy)*w + (xx+dx)] >= v) { ismax = 0; break; }
-        }
-      }
-      if (!ismax) continue;
+      // local max in filtered
+      if (v < filt[(size_t)yy*(size_t)w + (size_t)(xx-1)]) continue;
+      if (v < filt[(size_t)yy*(size_t)w + (size_t)(xx+1)]) continue;
+      if (v < filt[(size_t)(yy-1)*(size_t)w + (size_t)xx]) continue;
+      if (v < filt[(size_t)(yy+1)*(size_t)w + (size_t)xx]) continue;
 
-      // Must be within circular max_dist
-      double gx = (double)(x0 + xx) - goal_x0;
-      double gy = (double)(y0 + yy) - goal_y0;
-      if (hypot(gx, gy) > p->max_dist_pix) continue;
+      long x0 = d.sx1 + xx;
+      long y0 = d.sy1 + yy;
 
-      // Adjacent pixels above raw threshold (use raw image)
+      // within max distance from goal
+      double dxg = (double)x0 - goal_x0;
+      double dyg = (double)y0 - goal_y0;
+      if (hypot(dxg, dyg) > p->max_dist_pix) continue;
+
+      // adjacency check in raw residual image (patch)
       int nadj = 0;
-      long X = x0 + xx;
-      long Y = y0 + yy;
       for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
           if (dx == 0 && dy == 0) continue;
-          if ((double)img[(Y+dy)*nx + (X+dx)] > thr_raw) nadj++;
+          float rv = patch[(size_t)(yy+dy)*(size_t)w + (size_t)(xx+dx)];
+          if ((double)rv > thr_raw) nadj++;
         }
       }
       if (nadj < p->min_adjacent) continue;
 
-      if (v > best_v) {
-        best_v = v;
-        best_x = xx;
-        best_y = yy;
+      // best peak by raw peak value at that location (not filtered)
+      float rawv = patch[(size_t)yy*(size_t)w + (size_t)xx];
+      double snr_here = (d.sigma > 0) ? ((double)rawv / d.sigma) : 0;
+      if ((double)rawv > best_val) {
+        best_val = (double)rawv;
+        best_x = (int)x0;
+        best_y = (int)y0;
+        best_snr_raw = snr_here;
       }
     }
   }
 
   if (best_x < 0) {
+    free(patch); free(tmp); free(filt);
     d.found = 0;
-    free(patch); free(tmp); free(filt); free(k);
     return d;
   }
 
-  long peak_x0 = x0 + best_x;
-  long peak_y0 = y0 + best_y;
+  // Iterative Gaussian-windowed centroid on raw residuals (img - bkg)
+  double cx = (double)best_x;
+  double cy = (double)best_y;
 
-  d.peak_val = (double)img[peak_y0*nx + peak_x0];
-  d.peak_snr_raw = (d.peak_val - bkg) / sigma;
+  int hw = p->centroid_halfwin;
+  double s2 = p->centroid_sigma_pix * p->centroid_sigma_pix;
+  if (s2 <= 0.1) s2 = 0.1;
 
-  // Windowed centroid around peak; clamp to search ROI
-  double cx = (double)peak_x0;
-  double cy = (double)peak_y0;
-  double flux = 0.0;
-  int npixpos = 0;
+  double sumI = 0, sumX = 0, sumY = 0;
+  for (int it = 0; it < p->centroid_maxiter; it++) {
+    long xlo = (long)floor(cx) - hw;
+    long xhi = (long)floor(cx) + hw;
+    long ylo = (long)floor(cy) - hw;
+    long yhi = (long)floor(cy) + hw;
 
-  windowed_centroid(img, nx, ny,
-                    sx1, sx2, sy1, sy2,
-                    bkg,
-                    p->centroid_halfwin,
-                    p->centroid_sigma_pix,
-                    p->centroid_maxiter,
-                    p->centroid_eps_pix,
-                    cx, cy,
-                    &cx, &cy,
-                    &flux, &npixpos);
+    // clamp to search ROI
+    if (xlo < d.sx1) xlo = d.sx1;
+    if (xhi > d.sx2) xhi = d.sx2;
+    if (ylo < d.sy1) ylo = d.sy1;
+    if (yhi > d.sy2) yhi = d.sy2;
 
-  d.snr_ap = (npixpos > 0) ? (flux / (sigma * sqrt((double)npixpos))) : 0.0;
+    sumI = sumX = sumY = 0.0;
+    for (long y = ylo; y <= yhi; y++) {
+      long row0 = y * nx;
+      for (long x = xlo; x <= xhi; x++) {
+        double I = (double)img[row0 + x] - d.bkg;
+        if (I <= 0) continue;
+        double dx = (double)x - cx;
+        double dy = (double)y - cy;
+        double wgt = exp(-0.5*(dx*dx + dy*dy)/s2);
+        double ww = wgt * I;
+        sumI += ww;
+        sumX += ww * (double)x;
+        sumY += ww * (double)y;
+      }
+    }
 
-  // Convert to user origin
+    if (sumI <= 0) break;
+
+    double nxp = sumX / sumI;
+    double nyp = sumY / sumI;
+
+    double shift = hypot(nxp - cx, nyp - cy);
+    cx = nxp;
+    cy = nyp;
+
+    if (shift < p->centroid_eps_pix) break;
+  }
+
+  if (sumI <= 0 || !isfinite(cx) || !isfinite(cy)) {
+    free(patch); free(tmp); free(filt);
+    d.found = 0;
+    return d;
+  }
+
+  // aperture-like SNR within centroid window
+  long xlo = (long)floor(cx) - hw;
+  long xhi = (long)floor(cx) + hw;
+  long ylo = (long)floor(cy) - hw;
+  long yhi = (long)floor(cy) + hw;
+  if (xlo < d.sx1) xlo = d.sx1;
+  if (xhi > d.sx2) xhi = d.sx2;
+  if (ylo < d.sy1) ylo = d.sy1;
+  if (yhi > d.sy2) yhi = d.sy2;
+
+  double sig_sum = 0.0;
+  long npix = 0;
+  for (long y = ylo; y <= yhi; y++) {
+    long row0 = y * nx;
+    for (long x = xlo; x <= xhi; x++) {
+      double I = (double)img[row0 + x] - d.bkg;
+      if (I <= 0) continue;
+      sig_sum += I;
+      npix++;
+    }
+  }
+  double noise = d.sigma * sqrt((double)(npix > 1 ? npix : 1));
+  double snr_ap = (noise > 0) ? (sig_sum / noise) : 0.0;
+
   d.found = 1;
-  d.peak_x = (p->pixel_origin == 0) ? (double)peak_x0 : (double)peak_x0 + 1.0;
-  d.peak_y = (p->pixel_origin == 0) ? (double)peak_y0 : (double)peak_y0 + 1.0;
-  d.cx     = (p->pixel_origin == 0) ? cx : cx + 1.0;
-  d.cy     = (p->pixel_origin == 0) ? cy : cy + 1.0;
+  d.peak_val = best_val;
+  d.peak_snr_raw = best_snr_raw;
+  d.snr_ap = snr_ap;
 
-  // For reporting, use aperture-like SNR if it is valid, else peak
-  d.snr_ap = isfinite(d.snr_ap) ? d.snr_ap : 0.0;
+  d.peak_x = (p->pixel_origin == 0) ? (double)best_x : (double)best_x + 1.0;
+  d.peak_y = (p->pixel_origin == 0) ? (double)best_y : (double)best_y + 1.0;
+  d.cx     = (p->pixel_origin == 0) ? cx          : cx + 1.0;
+  d.cy     = (p->pixel_origin == 0) ? cy          : cy + 1.0;
 
-  free(patch); free(tmp); free(filt); free(k);
+  free(patch); free(tmp); free(filt);
   return d;
 }
 
-static int stat_file_basic(const char* path, time_t* mtime_out, off_t* size_out)
+// Compute a full FrameResult from an already-loaded FITS image and header.
+static FrameResult solve_frame(const float* img, long nx, long ny, const char* header, int nkeys, const AcqParams* p)
 {
-  struct stat st;
-  if (stat(path, &st) != 0) return 1;
-  if (!S_ISREG(st.st_mode)) return 2;
-  if (mtime_out) *mtime_out = st.st_mtime;
-  if (size_out) *size_out = st.st_size;
-  return 0;
-}
+  FrameResult r;
+  memset(&r, 0, sizeof(r));
 
-// Returns:
-//   0: success (new + stable)
-//   1: not new
-//   2+: error
-static int read_if_new_and_stable(const char* path, time_t* last_mtime, off_t* last_size,
-                                  const AcqParams* p,
-                                  float** img_out, long* nx_out, long* ny_out,
-                                  char** header_out, int* nkeys_out)
-{
-  time_t mt1=0, mt2=0;
-  off_t  sz1=0, sz2=0;
-
-  if (stat_file_basic(path, &mt1, &sz1) != 0) return 2;
-  if (sz1 <= 0) return 2;
-
-  if (*last_mtime != 0 && mt1 == *last_mtime && sz1 == *last_size) return 1;
-
-  // stability check (avoid reading while being written)
-  sleep_seconds(0.12);
-  if (stat_file_basic(path, &mt2, &sz2) != 0) return 2;
-  if (mt2 != mt1 || sz2 != sz1) return 2;
-
-  int st = read_fits_image_and_header(path, p, img_out, nx_out, ny_out, header_out, nkeys_out);
-  if (st) return 3;
-
-  *last_mtime = mt1;
-  *last_size  = sz1;
-  return 0;
-}
-
-static FrameResult process_frame(const char* path, const AcqParams* p, int do_debug)
-{
-  FrameResult fr;
-  memset(&fr, 0, sizeof(fr));
-
-  float* img = NULL;
-  long nx=0, ny=0;
-  char* header = NULL;
-  int nkeys = 0;
-
-  int st = read_fits_image_and_header(path, p, &img, &nx, &ny, &header, &nkeys);
-  if (st) {
-    if (p->verbose) fprintf(stderr, "ERROR: CFITSIO read failed for %s (status=%d)\n", path, st);
-    if (img) free(img);
-    if (header) free(header);
-    return fr;
+  r.det = detect_star_near_goal(img, nx, ny, p);
+  if (!r.det.found) {
+    r.ok = 0;
+    return r;
   }
 
-  Detection det = detect_star(img, nx, ny, p);
-  fr.det = det;
-
-  if (!det.found) {
-    if (p->verbose) fprintf(stderr, "No suitable star detected near goal.\n");
-    printf("NGPS_ACQ_RESULT found=0\n");
-    free(img);
-    if (header) free(header);
-    return fr;
-  }
-
-  // pixel offsets (in user origin)
-  fr.dx_pix = det.cx - p->goal_x;
-  fr.dy_pix = det.cy - p->goal_y;
+  r.dx_pix = r.det.cx - p->goal_x;
+  r.dy_pix = r.det.cy - p->goal_y;
 
   // WCS
   struct wcsprm* wcs = NULL;
   int nwcs = 0;
   int wcs_stat = init_wcs_from_header(header, nkeys, &wcs, &nwcs);
   if (wcs_stat != 0) {
-    if (p->verbose) fprintf(stderr, "ERROR: WCS parse failed (code=%d).\n", wcs_stat);
-    printf("NGPS_ACQ_RESULT found=1 cx=%.6f cy=%.6f dx_pix=%.6f dy_pix=%.6f snr_ap=%.3f wcs_ok=0\n",
-           det.cx, det.cy, fr.dx_pix, fr.dy_pix, det.snr_ap);
-
-    // debug image still useful
-    if (do_debug && p->debug_out[0]) {
-      long bgx1,bgx2,bgy1,bgy2;
-      compute_roi_0based(nx, ny, p->pixel_origin,
-                         p->bg_roi_mask, p->bg_x1, p->bg_x2, p->bg_y1, p->bg_y2,
-                         &bgx1, &bgx2, &bgy1, &bgy2);
-      (void)write_debug_ppm(p->debug_out, img, nx, ny, bgx1, bgx2, bgy1, bgy2,
-                            det.bkg, det.sigma, p->snr_thresh, &det, p);
-    }
-
-    wcsvfree(&nwcs, &wcs);
-    free(img);
-    if (header) free(header);
-    return fr;
+    r.wcs_ok = 0;
+    r.ok = 0;
+    return r;
   }
 
-  // Convert user->FITS 1-based for WCS
+  // Convert pixels to FITS 1-based for wcsp2s
   double goal_x1 = (p->pixel_origin == 0) ? (p->goal_x + 1.0) : p->goal_x;
   double goal_y1 = (p->pixel_origin == 0) ? (p->goal_y + 1.0) : p->goal_y;
-  double star_x1 = (p->pixel_origin == 0) ? (det.cx + 1.0)     : det.cx;
-  double star_y1 = (p->pixel_origin == 0) ? (det.cy + 1.0)     : det.cy;
+  double star_x1 = (p->pixel_origin == 0) ? (r.det.cx + 1.0)   : r.det.cx;
+  double star_y1 = (p->pixel_origin == 0) ? (r.det.cy + 1.0)   : r.det.cy;
 
-  double ra_goal=0, dec_goal=0, ra_star=0, dec_star=0;
-  if (pix2world_wcs(&wcs[0], goal_x1, goal_y1, &ra_goal, &dec_goal) ||
-      pix2world_wcs(&wcs[0], star_x1, star_y1, &ra_star, &dec_star)) {
-    if (p->verbose) fprintf(stderr, "ERROR: WCS pix2world failed.\n");
+  if (pix2world_wcs(&wcs[0], goal_x1, goal_y1, &r.ra_goal_deg, &r.dec_goal_deg) ||
+      pix2world_wcs(&wcs[0], star_x1, star_y1, &r.ra_star_deg, &r.dec_star_deg)) {
+    r.wcs_ok = 0;
+    r.ok = 0;
     wcsvfree(&nwcs, &wcs);
-    free(img);
-    if (header) free(header);
-    return fr;
-  }
-
-  fr.wcs_ok = 1;
-  fr.ra_goal_deg = ra_goal; fr.dec_goal_deg = dec_goal;
-  fr.ra_star_deg = ra_star; fr.dec_star_deg = dec_star;
-
-  // Commanded offsets that move star onto goal: (star - goal)
-  double dra_deg  = wrap_dra_deg(ra_star - ra_goal);
-  double ddec_deg = (dec_star - dec_goal);
-
-  double dra_arcsec = dra_deg * 3600.0;
-  if (p->dra_use_cosdec) {
-    double cosdec = cos(dec_goal * M_PI / 180.0);
-    dra_arcsec *= cosdec;
-  }
-  double ddec_arcsec = ddec_deg * 3600.0;
-
-  dra_arcsec *= (double)p->tcs_sign;
-  ddec_arcsec *= (double)p->tcs_sign;
-
-  fr.dra_cmd_arcsec = dra_arcsec;
-  fr.ddec_cmd_arcsec = ddec_arcsec;
-  fr.r_cmd_arcsec = hypot(dra_arcsec, ddec_arcsec);
-
-  fr.ok = 1;
-
-  // machine-readable output
-  printf("NGPS_ACQ_RESULT found=1 cx=%.6f cy=%.6f dx_pix=%.6f dy_pix=%.6f dra_arcsec=%.6f ddec_arcsec=%.6f r_arcsec=%.6f snr_ap=%.3f peak_snr=%.3f bkg=%.3f sigma=%.3f wcs_ok=1\n",
-         det.cx, det.cy, fr.dx_pix, fr.dy_pix,
-         fr.dra_cmd_arcsec, fr.ddec_cmd_arcsec, fr.r_cmd_arcsec,
-         det.snr_ap, det.peak_snr_raw, det.bkg, det.sigma);
-
-  if (p->verbose) {
-    fprintf(stderr, "Star: peak=(%.3f,%.3f) centroid=(%.3f,%.3f) dx=%.3f dy=%.3f pix | SNR_ap=%.2f peakSNR=%.2f\n",
-            det.peak_x, det.peak_y, det.cx, det.cy, fr.dx_pix, fr.dy_pix, det.snr_ap, det.peak_snr_raw);
-    fprintf(stderr, "TCS offsets: dra=%.3f\" ddec=%.3f\" (r=%.3f\")\n",
-            fr.dra_cmd_arcsec, fr.ddec_cmd_arcsec, fr.r_cmd_arcsec);
-  }
-
-  if (do_debug && p->debug_out[0]) {
-    long bgx1,bgx2,bgy1,bgy2;
-    compute_roi_0based(nx, ny, p->pixel_origin,
-                       p->bg_roi_mask, p->bg_x1, p->bg_x2, p->bg_y1, p->bg_y2,
-                       &bgx1, &bgx2, &bgy1, &bgy2);
-    int rc = write_debug_ppm(p->debug_out, img, nx, ny, bgx1, bgx2, bgy1, bgy2,
-                             det.bkg, det.sigma, p->snr_thresh, &det, p);
-    if (p->verbose && rc==0) fprintf(stderr, "Wrote debug overlay: %s\n", p->debug_out);
+    return r;
   }
 
   wcsvfree(&nwcs, &wcs);
-  free(img);
-  if (header) free(header);
-  return fr;
+
+  r.wcs_ok = 1;
+
+  // Commanded offsets: (star - goal)
+  double dra_deg  = wrap_dra_deg(r.ra_star_deg - r.ra_goal_deg);
+  double ddec_deg = (r.dec_star_deg - r.dec_goal_deg);
+
+  double cosdec = cos(r.dec_goal_deg * M_PI / 180.0);
+  double dra_arcsec = dra_deg * 3600.0;
+  if (p->dra_use_cosdec) dra_arcsec *= cosdec;
+  double ddec_arcsec = ddec_deg * 3600.0;
+
+  dra_arcsec  *= (double)p->tcs_sign;
+  ddec_arcsec *= (double)p->tcs_sign;
+
+  r.dra_cmd_arcsec = dra_arcsec;
+  r.ddec_cmd_arcsec = ddec_arcsec;
+  r.r_cmd_arcsec = hypot(dra_arcsec, ddec_arcsec);
+
+  // Final accept criteria for "good sample"
+  //  - windowed SNR must be >= threshold (it is typically more stable than raw peak SNR)
+  if (r.det.snr_ap < p->snr_thresh) {
+    r.ok = 0;
+    return r;
+  }
+
+  r.ok = 1;
+  return r;
 }
 
+// --- Frame acquisition / gating ---
+static int stat_file(const char* path, struct stat* st)
+{
+  if (stat(path, st) != 0) return 1;
+  if (st->st_size <= 0) return 2;
+  return 0;
+}
+
+static int wait_for_stream_update(const char* path, FrameState* fs, double settle_check_sec, double cadence_sec, int verbose)
+{
+  // Wait until file mtime/size changes from last accepted, then is stable across settle_check_sec.
+  // Also enforce a minimum time between accepted frames (cadence_sec).
+  struct stat st1, st2;
+  for (;;) {
+    if (g_stop) return 2;
+
+    if (stat_file(path, &st1) != 0) {
+      sleep_seconds(0.1);
+      continue;
+    }
+
+    // Newness check
+    if (fs->mtime == st1.st_mtime && fs->size == st1.st_size) {
+      sleep_seconds(0.1);
+      continue;
+    }
+
+    // Stability check (not writing)
+    sleep_seconds(settle_check_sec);
+    if (stat_file(path, &st2) != 0) {
+      sleep_seconds(0.1);
+      continue;
+    }
+    if (st2.st_mtime != st1.st_mtime || st2.st_size != st1.st_size) {
+      // still changing
+      sleep_seconds(0.05);
+      continue;
+    }
+
+    // Cadence check
+    if (cadence_sec > 0) {
+      double tnow = now_monotonic_sec();
+      double tlast = (double)fs->t_accept.tv_sec + 1e-9*(double)fs->t_accept.tv_nsec;
+      if (tlast > 0 && (tnow - tlast) < cadence_sec) {
+        sleep_seconds(0.05);
+        continue;
+      }
+    }
+
+    // accept this as a candidate to read
+    if (verbose) {
+      fprintf(stderr, "Frame candidate: mtime=%ld size=%ld\n", (long)st2.st_mtime, (long)st2.st_size);
+    }
+    fs->mtime = st2.st_mtime;
+    fs->size = st2.st_size;
+    clock_gettime(CLOCK_MONOTONIC, &fs->t_accept);
+    return 0;
+  }
+}
+
+// Read next frame into memory (img/header) according to frame_mode.
+// Returns 0 on success.
+static int acquire_next_frame(const AcqParams* p, FrameState* fs,
+                              float** img_out, long* nx_out, long* ny_out,
+                              char** header_out, int* nkeys_out)
+{
+  const char* path = NULL;
+
+  if (p->frame_mode == FRAME_FRAMEGRAB) {
+    // Acquire synchronously via scam
+    if (scam_framegrab_one(p->framegrab_out, p->verbose)) return 2;
+    // Give filesystem a tiny moment; and then read when stable
+    // (framegrab should generally be complete when system() returns, but be safe)
+    (void)wait_for_stream_update(p->framegrab_out, fs, 0.05, 0.0, 0);
+    path = p->framegrab_out;
+  } else {
+    // Stream mode: wait until file updates
+    if (wait_for_stream_update(p->input, fs, 0.05, p->cadence_sec, 0)) return 3;
+    path = p->input;
+  }
+
+  int used_hdu = 0;
+  char used_extname[64] = {0};
+  int st = read_fits_image_and_header(path, p, img_out, nx_out, ny_out, header_out, nkeys_out,
+                                      &used_hdu, used_extname, sizeof(used_extname));
+  if (st) {
+    fprintf(stderr, "ERROR: CFITSIO read failed for %s (status=%d)\n", path, st);
+    return 4;
+  }
+  return 0;
+}
+
+// --- CLI ---
 static void usage(const char* argv0)
 {
   fprintf(stderr,
-    "Usage: %s --input FILE.fits --goal-x X --goal-y Y [options]\n"
-    "\n"
-    "Main mode: single FITS file (updated by camera). No directory mode.\n"
+    "Usage: %s --input PATH --goal-x X --goal-y Y [options]\n"
     "\n"
     "Core options:\n"
-    "  --pixel-origin 0|1        Pixel origin for goal/ROI (default 0)\n"
-    "  --max-dist PIX            Search radius around goal (default 200)\n"
-    "  --snr S                   Detection threshold in sigma (default 8)\n"
-    "  --min-adj N               Min adjacent raw pixels above threshold (default 4)\n"
+    "  --input PATH                 Streamed FITS file path (default /tmp/slicecam.fits)\n"
+    "  --goal-x X --goal-y Y        Goal pixel coordinates\n"
+    "  --pixel-origin 0|1           Coordinate origin for goal/ROI (default 0)\n"
+    "\n"
+    "Frame acquisition:\n"
+    "  --frame-mode stream|framegrab    (default stream)\n"
+    "  --framegrab-out PATH             Output FITS path for framegrab (default /tmp/ngps_acq.fits)\n"
     "\n"
     "Detection / centroiding:\n"
-    "  --filt-sigma PIX          Gaussian smoothing sigma for detection (default 1.0)\n"
-    "  --centroid-hw N           Centroid window half-width (default 6)\n"
-    "  --centroid-sigma PIX      Gaussian window sigma (default 2.0)\n"
-    "  --centroid-maxiter N      (default 10)\n"
+    "  --snr S                     SNR threshold (sigma) (default 8)\n"
+    "  --max-dist PIX               Search radius around goal (default 200)\n"
+    "  --min-adj N                  Min adjacent raw pixels above threshold (default 4)\n"
+    "  --filt-sigma PIX             Detection filter sigma (default 1.2)\n"
+    "  --centroid-hw N              Centroid half-window (default 6)\n"
+    "  --centroid-sigma PIX         Centroid window sigma (default 2.0)\n"
     "\n"
     "FITS selection:\n"
-    "  --extname NAME            Preferred image EXTNAME (default L). Use 'none' to disable\n"
-    "  --extnum N                Fallback HDU (0=primary, 1=first ext...) (default 1)\n"
+    "  --extname NAME               Prefer this EXTNAME (default L). Use 'none' to disable.\n"
+    "  --extnum N                   Fallback HDU index (0=primary,1=first ext...) (default 1)\n"
     "\n"
     "ROIs (inclusive bounds; same origin as goal):\n"
-    "  Background stats ROI:\n"
-    "    --bg-x1 N --bg-x2 N --bg-y1 N --bg-y2 N\n"
-    "    (aliases: --roi-x1/--roi-x2/--roi-y1/--roi-y2)\n"
-    "  Candidate search ROI (defaults to bg ROI):\n"
-    "    --search-x1 N --search-x2 N --search-y1 N --search-y2 N\n"
+    "  --bg-x1 N --bg-x2 N --bg-y1 N --bg-y2 N        Background/stats ROI\n"
+    "  --search-x1 N --search-x2 N --search-y1 N --search-y2 N  Search ROI (defaults to bg ROI)\n"
     "\n"
-    "Closed-loop acquisition wrapper:\n"
-    "  --loop 0|1                Enable closed-loop mode (default 0)\n"
-    "  --cadence-sec S           Seconds between accepted samples (default 4)\n"
-    "  --prec-arcsec A           Required centroiding precision per axis (MAD->sigma) (default 0.1)\n"
-    "  --goal-arcsec A           Stop when robust |offset| < A (default 0.1)\n"
-    "  --max-samples N           Max samples gathered per move (default 10)\n"
-    "  --min-samples N           Min samples before checking precision (default 3)\n"
-    "  --max-cycles N            Max move cycles (default 50)\n"
-    "  --gain G                  Multiply commanded move (default 1.0; try 0.8)\n"
+    "Closed-loop acquisition:\n"
+    "  --loop 0|1                   Enable closed-loop mode (default 0)\n"
+    "  --cadence-sec S              Minimum seconds between accepted frames (stream) (default 0.0)\n"
+    "  --max-samples N              Samples to collect per move (default 10)\n"
+    "  --min-samples N              Minimum before evaluating precision (default 3)\n"
+    "  --prec-arcsec A              Required robust scatter per axis (default 0.1)\n"
+    "  --goal-arcsec A              Converge threshold on |offset| (default 0.1)\n"
+    "  --max-cycles N               Move cycles (default 20)\n"
+    "  --gain G                     Gain applied to move (default 0.7)\n"
     "\n"
-    "TCS/WCS conventions:\n"
-    "  --dra-cosdec 0|1          Use dra = dRA*cos(dec) (default 1)\n"
-    "  --tcs-sign -1|1           Multiply commanded offsets by +/-1 (default 1)\n"
-    "  --tcs-set-units 0|1       Run: tcs native dra 'arcsec' and ddec 'arcsec' once (default 1)\n"
+    "Robustness / safety:\n"
+    "  --reject-identical 0|1       Reject identical frames (default 1)\n"
+    "  --reject-after-move N        Reject N new frames after move (default 2)\n"
+    "  --settle-sec S               Sleep after move (default 0.0)\n"
+    "  --max-move-arcsec A          Do not issue moves larger than this (default 10)\n"
+    "  --continue-on-fail 0|1       If 0: exit on failure; if 1: keep trying (default 0)\n"
+    "\n"
+    "TCS conventions:\n"
+    "  --tcs-set-units 0|1          Set native dra/ddec units to arcsec once (default 1)\n"
+    "  --dra-use-cosdec 0|1         dra = dRA*cos(dec) (default 1)\n"
+    "  --tcs-sign +1|-1             Multiply commanded offsets by sign (default +1)\n"
     "\n"
     "Debug:\n"
-    "  --debug 0|1               Write debug PPM overlay (default 0)\n"
-    "  --debug-out FILE          Debug PPM path (default ngps_acq_debug.ppm)\n"
+    "  --debug 0|1                  Write overlay PPM (default 0)\n"
+    "  --debug-out PATH             PPM path (default ./ngps_acq_debug.ppm)\n"
     "\n"
-    "Other:\n"
-    "  --dry-run 0|1             Do not call TCS (default 0)\n"
-    "  --verbose 0|1             Verbose logging (default 1)\n",
-    argv0);
+    "General:\n"
+    "  --dry-run 0|1                Do not call TCS (default 0)\n"
+    "  --verbose 0|1                Verbose logs (default 1)\n",
+    argv0
+  );
 }
 
 static void set_defaults(AcqParams* p)
 {
   memset(p, 0, sizeof(*p));
-  snprintf(p->input, sizeof(p->input), "");
+  snprintf(p->input, sizeof(p->input), "/tmp/slicecam.fits");
+  p->frame_mode = FRAME_STREAM;
+  snprintf(p->framegrab_out, sizeof(p->framegrab_out), "/tmp/ngps_acq.fits");
+  p->framegrab_use_tmp = 0;
 
   p->goal_x = 0;
   p->goal_y = 0;
@@ -1239,34 +1327,41 @@ static void set_defaults(AcqParams* p)
   p->snr_thresh = 8.0;
   p->min_adjacent = 4;
 
-  p->filt_sigma_pix = 1.0;
+  p->filt_sigma_pix = 1.2;
 
   p->centroid_halfwin = 6;
   p->centroid_sigma_pix = 2.0;
-  p->centroid_maxiter = 10;
+  p->centroid_maxiter = 12;
   p->centroid_eps_pix = 0.01;
 
-  snprintf(p->extname, sizeof(p->extname), "L");
   p->extnum = 1;
+  snprintf(p->extname, sizeof(p->extname), "L");
 
   p->bg_roi_mask = 0;
   p->search_roi_mask = 0;
 
   p->loop = 0;
-  p->cadence_sec = 4.0;
+  p->cadence_sec = 0.0;
   p->max_samples = 10;
   p->min_samples = 3;
   p->prec_arcsec = 0.1;
   p->goal_arcsec = 0.1;
-  p->max_cycles = 50;
-  p->gain = 1.0;
+  p->max_cycles = 20;
+  p->gain = 0.7;
+
+  p->reject_identical = 1;
+  p->reject_after_move = 2;
+  p->settle_sec = 0.0;
+  p->max_move_arcsec = 10.0;
+  p->continue_on_fail = 0;
 
   p->dra_use_cosdec = 1;
-  p->tcs_sign = 1;
+  p->tcs_sign = +1;
+
   p->tcs_set_units = 1;
 
   p->debug = 0;
-  snprintf(p->debug_out, sizeof(p->debug_out), "ngps_acq_debug.ppm");
+  snprintf(p->debug_out, sizeof(p->debug_out), "./ngps_acq_debug.ppm");
 
   p->dry_run = 0;
   p->verbose = 1;
@@ -1275,292 +1370,375 @@ static void set_defaults(AcqParams* p)
 static int parse_args(int argc, char** argv, AcqParams* p)
 {
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--input") && i+1 < argc) {
+    const char* a = argv[i];
+    if (!strcmp(a, "--input") && i+1 < argc) {
       snprintf(p->input, sizeof(p->input), "%s", argv[++i]);
-    } else if (!strcmp(argv[i], "--goal-x") && i+1 < argc) {
+    } else if (!strcmp(a, "--goal-x") && i+1 < argc) {
       p->goal_x = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--goal-y") && i+1 < argc) {
+    } else if (!strcmp(a, "--goal-y") && i+1 < argc) {
       p->goal_y = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--pixel-origin") && i+1 < argc) {
+    } else if (!strcmp(a, "--pixel-origin") && i+1 < argc) {
       p->pixel_origin = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--max-dist") && i+1 < argc) {
+
+    } else if (!strcmp(a, "--frame-mode") && i+1 < argc) {
+      const char* m = argv[++i];
+      if (!strcasecmp(m, "stream")) p->frame_mode = FRAME_STREAM;
+      else if (!strcasecmp(m, "framegrab")) p->frame_mode = FRAME_FRAMEGRAB;
+      else { fprintf(stderr, "Invalid --frame-mode: %s\n", m); return -1; }
+    } else if (!strcmp(a, "--framegrab-out") && i+1 < argc) {
+      snprintf(p->framegrab_out, sizeof(p->framegrab_out), "%s", argv[++i]);
+
+    } else if (!strcmp(a, "--max-dist") && i+1 < argc) {
       p->max_dist_pix = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--snr") && i+1 < argc) {
+    } else if (!strcmp(a, "--snr") && i+1 < argc) {
       p->snr_thresh = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--min-adj") && i+1 < argc) {
+    } else if (!strcmp(a, "--min-adj") && i+1 < argc) {
       p->min_adjacent = atoi(argv[++i]);
-
-    } else if (!strcmp(argv[i], "--filt-sigma") && i+1 < argc) {
+    } else if (!strcmp(a, "--filt-sigma") && i+1 < argc) {
       p->filt_sigma_pix = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--centroid-hw") && i+1 < argc) {
+    } else if (!strcmp(a, "--centroid-hw") && i+1 < argc) {
       p->centroid_halfwin = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--centroid-sigma") && i+1 < argc) {
+    } else if (!strcmp(a, "--centroid-sigma") && i+1 < argc) {
       p->centroid_sigma_pix = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--centroid-maxiter") && i+1 < argc) {
-      p->centroid_maxiter = atoi(argv[++i]);
 
-    } else if (!strcmp(argv[i], "--extnum") && i+1 < argc) {
+    } else if (!strcmp(a, "--extnum") && i+1 < argc) {
       p->extnum = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--extname") && i+1 < argc) {
+    } else if (!strcmp(a, "--extname") && i+1 < argc) {
       snprintf(p->extname, sizeof(p->extname), "%s", argv[++i]);
       if (!strcasecmp(p->extname, "none")) p->extname[0] = '\0';
 
-    } else if (!strcmp(argv[i], "--loop") && i+1 < argc) {
-      p->loop = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--cadence-sec") && i+1 < argc) {
-      p->cadence_sec = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--prec-arcsec") && i+1 < argc) {
-      p->prec_arcsec = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--goal-arcsec") && i+1 < argc) {
-      p->goal_arcsec = atof(argv[++i]);
-    } else if (!strcmp(argv[i], "--max-samples") && i+1 < argc) {
-      p->max_samples = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--min-samples") && i+1 < argc) {
-      p->min_samples = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--max-cycles") && i+1 < argc) {
-      p->max_cycles = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--gain") && i+1 < argc) {
-      p->gain = atof(argv[++i]);
-
-    } else if (!strcmp(argv[i], "--dra-cosdec") && i+1 < argc) {
-      p->dra_use_cosdec = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--tcs-sign") && i+1 < argc) {
-      p->tcs_sign = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--tcs-set-units") && i+1 < argc) {
-      p->tcs_set_units = atoi(argv[++i]);
-
-    } else if (!strcmp(argv[i], "--debug") && i+1 < argc) {
-      p->debug = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--debug-out") && i+1 < argc) {
-      snprintf(p->debug_out, sizeof(p->debug_out), "%s", argv[++i]);
-
-    } else if (!strcmp(argv[i], "--dry-run") && i+1 < argc) {
-      p->dry_run = atoi(argv[++i]);
-    } else if (!strcmp(argv[i], "--verbose") && i+1 < argc) {
-      p->verbose = atoi(argv[++i]);
-
-    // Background ROI
-    } else if (!strcmp(argv[i], "--bg-x1") && i+1 < argc) {
+    } else if (!strcmp(a, "--bg-x1") && i+1 < argc) {
       p->bg_x1 = atol(argv[++i]); p->bg_roi_mask |= ROI_X1_SET;
-    } else if (!strcmp(argv[i], "--bg-x2") && i+1 < argc) {
+    } else if (!strcmp(a, "--bg-x2") && i+1 < argc) {
       p->bg_x2 = atol(argv[++i]); p->bg_roi_mask |= ROI_X2_SET;
-    } else if (!strcmp(argv[i], "--bg-y1") && i+1 < argc) {
+    } else if (!strcmp(a, "--bg-y1") && i+1 < argc) {
       p->bg_y1 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y1_SET;
-    } else if (!strcmp(argv[i], "--bg-y2") && i+1 < argc) {
+    } else if (!strcmp(a, "--bg-y2") && i+1 < argc) {
       p->bg_y2 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y2_SET;
 
-    // Alias roi-* for bg ROI
-    } else if (!strcmp(argv[i], "--roi-x1") && i+1 < argc) {
-      p->bg_x1 = atol(argv[++i]); p->bg_roi_mask |= ROI_X1_SET;
-    } else if (!strcmp(argv[i], "--roi-x2") && i+1 < argc) {
-      p->bg_x2 = atol(argv[++i]); p->bg_roi_mask |= ROI_X2_SET;
-    } else if (!strcmp(argv[i], "--roi-y1") && i+1 < argc) {
-      p->bg_y1 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y1_SET;
-    } else if (!strcmp(argv[i], "--roi-y2") && i+1 < argc) {
-      p->bg_y2 = atol(argv[++i]); p->bg_roi_mask |= ROI_Y2_SET;
-
-    // Search ROI
-    } else if (!strcmp(argv[i], "--search-x1") && i+1 < argc) {
+    } else if (!strcmp(a, "--search-x1") && i+1 < argc) {
       p->search_x1 = atol(argv[++i]); p->search_roi_mask |= ROI_X1_SET;
-    } else if (!strcmp(argv[i], "--search-x2") && i+1 < argc) {
+    } else if (!strcmp(a, "--search-x2") && i+1 < argc) {
       p->search_x2 = atol(argv[++i]); p->search_roi_mask |= ROI_X2_SET;
-    } else if (!strcmp(argv[i], "--search-y1") && i+1 < argc) {
+    } else if (!strcmp(a, "--search-y1") && i+1 < argc) {
       p->search_y1 = atol(argv[++i]); p->search_roi_mask |= ROI_Y1_SET;
-    } else if (!strcmp(argv[i], "--search-y2") && i+1 < argc) {
+    } else if (!strcmp(a, "--search-y2") && i+1 < argc) {
       p->search_y2 = atol(argv[++i]); p->search_roi_mask |= ROI_Y2_SET;
 
-    } else if (!strcmp(argv[i], "--help")) {
+    } else if (!strcmp(a, "--loop") && i+1 < argc) {
+      p->loop = atoi(argv[++i]);
+    } else if (!strcmp(a, "--cadence-sec") && i+1 < argc) {
+      p->cadence_sec = atof(argv[++i]);
+    } else if (!strcmp(a, "--max-samples") && i+1 < argc) {
+      p->max_samples = atoi(argv[++i]);
+    } else if (!strcmp(a, "--min-samples") && i+1 < argc) {
+      p->min_samples = atoi(argv[++i]);
+    } else if (!strcmp(a, "--prec-arcsec") && i+1 < argc) {
+      p->prec_arcsec = atof(argv[++i]);
+    } else if (!strcmp(a, "--goal-arcsec") && i+1 < argc) {
+      p->goal_arcsec = atof(argv[++i]);
+    } else if (!strcmp(a, "--max-cycles") && i+1 < argc) {
+      p->max_cycles = atoi(argv[++i]);
+    } else if (!strcmp(a, "--gain") && i+1 < argc) {
+      p->gain = atof(argv[++i]);
+
+    } else if (!strcmp(a, "--reject-identical") && i+1 < argc) {
+      p->reject_identical = atoi(argv[++i]);
+    } else if (!strcmp(a, "--reject-after-move") && i+1 < argc) {
+      p->reject_after_move = atoi(argv[++i]);
+    } else if (!strcmp(a, "--settle-sec") && i+1 < argc) {
+      p->settle_sec = atof(argv[++i]);
+    } else if (!strcmp(a, "--max-move-arcsec") && i+1 < argc) {
+      p->max_move_arcsec = atof(argv[++i]);
+    } else if (!strcmp(a, "--continue-on-fail") && i+1 < argc) {
+      p->continue_on_fail = atoi(argv[++i]);
+
+    } else if (!strcmp(a, "--dra-use-cosdec") && i+1 < argc) {
+      p->dra_use_cosdec = atoi(argv[++i]);
+    } else if (!strcmp(a, "--tcs-sign") && i+1 < argc) {
+      p->tcs_sign = atoi(argv[++i]);
+      if (!(p->tcs_sign == 1 || p->tcs_sign == -1)) { fprintf(stderr, "--tcs-sign must be +1 or -1\n"); return -1; }
+    } else if (!strcmp(a, "--tcs-set-units") && i+1 < argc) {
+      p->tcs_set_units = atoi(argv[++i]);
+
+    } else if (!strcmp(a, "--debug") && i+1 < argc) {
+      p->debug = atoi(argv[++i]);
+    } else if (!strcmp(a, "--debug-out") && i+1 < argc) {
+      snprintf(p->debug_out, sizeof(p->debug_out), "%s", argv[++i]);
+
+    } else if (!strcmp(a, "--dry-run") && i+1 < argc) {
+      p->dry_run = atoi(argv[++i]);
+    } else if (!strcmp(a, "--verbose") && i+1 < argc) {
+      p->verbose = atoi(argv[++i]);
+
+    } else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
       return 0;
     } else {
-      fprintf(stderr, "Unknown/invalid arg: %s\n", argv[i]);
+      fprintf(stderr, "Unknown/invalid arg: %s\n", a);
       return -1;
     }
   }
 
-  if (p->input[0] == '\0') {
-    fprintf(stderr, "You must provide --input FILE.fits\n");
-    return -1;
-  }
-  if (p->goal_x == 0 && p->goal_y == 0) {
-    fprintf(stderr, "You must provide --goal-x and --goal-y\n");
-    return -1;
-  }
   if (!(p->pixel_origin == 0 || p->pixel_origin == 1)) {
     fprintf(stderr, "--pixel-origin must be 0 or 1\n");
     return -1;
   }
-  if (p->max_dist_pix < 3) p->max_dist_pix = 3;
-  if (p->snr_thresh < 1) p->snr_thresh = 1;
-  if (p->min_adjacent < 0) p->min_adjacent = 0;
-  if (p->centroid_halfwin < 2) p->centroid_halfwin = 2;
-  if (p->centroid_maxiter < 1) p->centroid_maxiter = 1;
-  if (p->cadence_sec < 0.1) p->cadence_sec = 0.1;
+  if (!isfinite(p->goal_x) || !isfinite(p->goal_y)) {
+    fprintf(stderr, "You must provide --goal-x and --goal-y\n");
+    return -1;
+  }
   if (p->max_samples < 1) p->max_samples = 1;
   if (p->min_samples < 1) p->min_samples = 1;
   if (p->min_samples > p->max_samples) p->min_samples = p->max_samples;
-  if (p->max_cycles < 1) p->max_cycles = 1;
-  if (p->gain <= 0) p->gain = 1.0;
+  if (p->gain < 0) p->gain = 0;
   if (p->gain > 1.5) p->gain = 1.5;
-  if (!(p->tcs_sign == 1 || p->tcs_sign == -1)) p->tcs_sign = 1;
-
+  if (p->max_move_arcsec <= 0) p->max_move_arcsec = 10.0;
+  if (p->reject_after_move < 0) p->reject_after_move = 0;
+  if (p->cadence_sec < 0) p->cadence_sec = 0;
+  if (p->filt_sigma_pix <= 0) p->filt_sigma_pix = 1.2;
+  if (p->centroid_sigma_pix <= 0) p->centroid_sigma_pix = 2.0;
+  if (p->centroid_halfwin < 2) p->centroid_halfwin = 2;
   return 1;
 }
 
-static int run_one_shot(const AcqParams* p)
+// --- One-shot processing ---
+static int process_once(const AcqParams* p, FrameState* fs)
 {
-  (void)tcs_set_units_once(p);
-  FrameResult fr = process_frame(p->input, p, p->debug);
-  if (!fr.ok) return 2;
+  float* img = NULL;
+  long nx=0, ny=0;
+  char* header = NULL;
+  int nkeys = 0;
 
-  if (fr.r_cmd_arcsec <= p->goal_arcsec) {
-    if (p->verbose) fprintf(stderr, "Within goal threshold (%.3f\") - no move.\n", p->goal_arcsec);
-    return 0;
+  int rc = acquire_next_frame(p, fs, &img, &nx, &ny, &header, &nkeys);
+  if (rc) {
+    if (img) free(img);
+    if (header) free(header);
+    return 4;
   }
 
-  // One-shot move
-  (void)tcs_move_arcsec(p->gain * fr.dra_cmd_arcsec, p->gain * fr.ddec_cmd_arcsec, p);
+  // signature for rejecting identical frames
+  if (p->reject_identical) {
+    long sx1,sx2,sy1,sy2;
+    compute_roi_0based(nx, ny, p->pixel_origin,
+                       p->bg_roi_mask, p->bg_x1, p->bg_x2, p->bg_y1, p->bg_y2,
+                       &sx1,&sx2,&sy1,&sy2);
+    uint64_t sig = image_signature_subsample(img, nx, ny, sx1,sx2,sy1,sy2);
+    if (fs->have_sig && sig == fs->sig) {
+      if (p->verbose) fprintf(stderr, "Duplicate frame signature (reject).\n");
+      free(img);
+      if (header) free(header);
+      return 2;
+    }
+    fs->sig = sig;
+    fs->have_sig = 1;
+  }
+
+  FrameResult fr = solve_frame(img, nx, ny, header, nkeys, p);
+
+  if (p->debug) {
+    (void)write_debug_ppm(p->debug_out, img, nx,
+                          fr.det.rx1, fr.det.rx2, fr.det.ry1, fr.det.ry2,
+                          fr.det.bkg, fr.det.sigma, p->snr_thresh,
+                          &fr.det, p);
+  }
+
+  free(img);
+  if (header) free(header);
+
+  if (!fr.ok) {
+    if (p->verbose) fprintf(stderr, "No valid solution (star/WCS/quality).\n");
+    return 2;
+  }
+
+  if (p->verbose) {
+    fprintf(stderr, "Centroid=(%.3f,%.3f) dx=%.3f dy=%.3f pix  SNR_ap=%.2f\n",
+            fr.det.cx, fr.det.cy, fr.dx_pix, fr.dy_pix, fr.det.snr_ap);
+    fprintf(stderr, "Command offsets (arcsec): dra=%.3f ddec=%.3f  r=%.3f\n",
+            fr.dra_cmd_arcsec, fr.ddec_cmd_arcsec, fr.r_cmd_arcsec);
+  }
+
+  // Machine-readable line
+  printf("NGPS_ACQ_RESULT ok=1 cx=%.6f cy=%.6f dra_arcsec=%.6f ddec_arcsec=%.6f r_arcsec=%.6f snr_ap=%.3f\n",
+         fr.det.cx, fr.det.cy, fr.dra_cmd_arcsec, fr.ddec_cmd_arcsec, fr.r_cmd_arcsec, fr.det.snr_ap);
+
+  // Safety: do not move without stats in loop mode; in one-shot we do a single move only if --loop=0
+  if (!p->loop) {
+    if (fr.r_cmd_arcsec > p->max_move_arcsec) {
+      fprintf(stderr, "REFUSE MOVE: |offset|=%.3f"" exceeds --max-move-arcsec=%.3f\n", fr.r_cmd_arcsec, p->max_move_arcsec);
+      return 3;
+    }
+
+    double dra = p->gain * fr.dra_cmd_arcsec;
+    double ddec = p->gain * fr.ddec_cmd_arcsec;
+
+    (void)tcs_move_arcsec(dra, ddec, p->dry_run, p->verbose);
+  }
+
   return 0;
 }
 
-static int run_closed_loop(const AcqParams* p)
+// --- Closed-loop acquisition ---
+static int run_loop(const AcqParams* p)
 {
-  (void)tcs_set_units_once(p);
+  FrameState fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.t_accept.tv_sec = 0;
+  fs.t_accept.tv_nsec = 0;
 
-  time_t last_mtime = 0;
-  off_t  last_size  = 0;
+  if (p->tcs_set_units) (void)tcs_set_native_units(p->dry_run, p->verbose);
 
-  if (p->verbose) {
-    fprintf(stderr,
-            "Closed-loop acquisition:\n"
-            "  cadence=%.2fs max_samples=%d min_samples=%d prec=%.3f\" goal=%.3f\" gain=%.2f max_cycles=%d\n",
-            p->cadence_sec, p->max_samples, p->min_samples, p->prec_arcsec, p->goal_arcsec, p->gain, p->max_cycles);
-  }
+  int skip_after_move = 0;
 
   for (int cycle = 1; cycle <= p->max_cycles && !g_stop; cycle++) {
-    if (p->verbose) fprintf(stderr, "\n=== Cycle %d/%d: gather offsets (no move yet) ===\n", cycle, p->max_cycles);
+    if (p->verbose) fprintf(stderr, "\n=== Cycle %d/%d ===\n", cycle, p->max_cycles);
 
-    double* dra = (double*)calloc((size_t)p->max_samples, sizeof(double));
-    double* ddec = (double*)calloc((size_t)p->max_samples, sizeof(double));
-    double* r = (double*)calloc((size_t)p->max_samples, sizeof(double));
-    if (!dra || !ddec || !r) die("calloc samples failed");
+    double dra_samp[p->max_samples];
+    double ddec_samp[p->max_samples];
+    int n = 0;
 
-    int ns = 0;
-    while (ns < p->max_samples && !g_stop) {
-      // Wait for a new stable frame
-      float* img = NULL; long nx=0, ny=0; char* header=NULL; int nkeys=0;
-      int rr = read_if_new_and_stable(p->input, &last_mtime, &last_size, p, &img, &nx, &ny, &header, &nkeys);
-      if (rr == 1) {
-        sleep_seconds(0.10);
-        continue;
-      } else if (rr != 0) {
-        if (p->verbose) fprintf(stderr, "WARNING: could not read new stable frame (rr=%d).\n", rr);
-        sleep_seconds(0.20);
+    int attempts = 0;
+    int max_attempts = p->max_samples * 10;
+
+    while (n < p->max_samples && attempts < max_attempts && !g_stop) {
+      attempts++;
+
+      float* img = NULL;
+      long nx=0, ny=0;
+      char* header = NULL;
+      int nkeys = 0;
+
+      int rc = acquire_next_frame(p, &fs, &img, &nx, &ny, &header, &nkeys);
+      if (rc) {
+        if (img) free(img);
+        if (header) free(header);
+        fprintf(stderr, "WARNING: failed to acquire frame (rc=%d)\n", rc);
+        sleep_seconds(0.1);
         continue;
       }
 
-      // We already read the file; reuse the data path by temporarily writing to a temp file is silly.
-      // Instead, process on the already-read arrays would require refactoring.
-      // So: free and re-call process_frame() (CFITSIO read). The stability gate ensures consistency.
+      // signature-based duplicate reject (compute on stats ROI)
+      if (p->reject_identical) {
+        long sx1,sx2,sy1,sy2;
+        compute_roi_0based(nx, ny, p->pixel_origin,
+                           p->bg_roi_mask, p->bg_x1, p->bg_x2, p->bg_y1, p->bg_y2,
+                           &sx1,&sx2,&sy1,&sy2);
+        uint64_t sig = image_signature_subsample(img, nx, ny, sx1,sx2,sy1,sy2);
+        if (fs.have_sig && sig == fs.sig) {
+          if (p->verbose) fprintf(stderr, "Reject: identical frame signature\n");
+          free(img);
+          if (header) free(header);
+          continue;
+        }
+        fs.sig = sig;
+        fs.have_sig = 1;
+      }
+
+      if (skip_after_move > 0) {
+        skip_after_move--;
+        if (p->verbose) fprintf(stderr, "Reject: post-move frame (%d remaining)\n", skip_after_move);
+        free(img);
+        if (header) free(header);
+        continue;
+      }
+
+      FrameResult fr = solve_frame(img, nx, ny, header, nkeys, p);
+
+      if (p->debug) {
+        (void)write_debug_ppm(p->debug_out, img, nx,
+                              fr.det.rx1, fr.det.rx2, fr.det.ry1, fr.det.ry2,
+                              fr.det.bkg, fr.det.sigma, p->snr_thresh,
+                              &fr.det, p);
+      }
+
       free(img);
       if (header) free(header);
 
-      FrameResult fr = process_frame(p->input, p, p->debug);
       if (!fr.ok) {
-        if (p->verbose) fprintf(stderr, "Sample rejected (no star or WCS).\n");
-        sleep_seconds(p->cadence_sec);
+        if (p->verbose) fprintf(stderr, "Reject: no valid solution (SNR/WCS/star).\n");
         continue;
       }
 
-      dra[ns] = fr.dra_cmd_arcsec;
-      ddec[ns] = fr.ddec_cmd_arcsec;
-      r[ns] = fr.r_cmd_arcsec;
-      ns++;
-
-      // Print sample summary
-      if (p->verbose) {
-        fprintf(stderr, "Sample %d/%d: dra=%.3f\" ddec=%.3f\" r=%.3f\"\n",
-                ns, p->max_samples, fr.dra_cmd_arcsec, fr.ddec_cmd_arcsec, fr.r_cmd_arcsec);
+      if (fr.r_cmd_arcsec > p->max_move_arcsec) {
+        fprintf(stderr, "Reject: |offset|=%.3f"" exceeds --max-move-arcsec=%.3f\n", fr.r_cmd_arcsec, p->max_move_arcsec);
+        continue;
       }
 
-      // Evaluate precision after min_samples
-      if (ns >= p->min_samples) {
-        double* tmpa = (double*)malloc((size_t)ns*sizeof(double));
-        double* tmpd = (double*)malloc((size_t)ns*sizeof(double));
-        if (!tmpa || !tmpd) die("malloc tmp med failed");
-        memcpy(tmpa, dra, (size_t)ns*sizeof(double));
-        memcpy(tmpd, ddec, (size_t)ns*sizeof(double));
-        double med_a = median_of_doubles(tmpa, ns);
-        double med_d = median_of_doubles(tmpd, ns);
-        free(tmpa); free(tmpd);
+      dra_samp[n]  = fr.dra_cmd_arcsec;
+      ddec_samp[n] = fr.ddec_cmd_arcsec;
+      n++;
 
-        double sig_a = mad_sigma_of_doubles(dra, ns, med_a);
-        double sig_d = mad_sigma_of_doubles(ddec, ns, med_d);
+      // Compute robust stats on the fly
+      double dra_tmp[p->max_samples];
+      double ddec_tmp[p->max_samples];
+      for (int i = 0; i < n; i++) { dra_tmp[i]=dra_samp[i]; ddec_tmp[i]=ddec_samp[i]; }
+      double med_dra = median_of_doubles(dra_tmp, n);
+      double med_ddec = median_of_doubles(ddec_tmp, n);
+      double sig_dra = mad_sigma_of_doubles(dra_samp, n, med_dra);
+      double sig_ddec = mad_sigma_of_doubles(ddec_samp, n, med_ddec);
+      double rmed = hypot(med_dra, med_ddec);
+
+      if (p->verbose) {
+        fprintf(stderr, "Sample %d/%d: dra=%.3f"" ddec=%.3f"" |med|=%.3f""  scatter(MAD)=(%.3f,%.3f)""\n",
+                n, p->max_samples, dra_samp[n-1], ddec_samp[n-1], rmed, sig_dra, sig_ddec);
+      }
+
+      // If already within goal threshold, finish (no move)
+      if (n >= p->min_samples && rmed <= p->goal_arcsec) {
+        if (p->verbose) fprintf(stderr, "Converged: |median offset|=%.3f"" <= %.3f""\n", rmed, p->goal_arcsec);
+        return 0;
+      }
+
+      // If centroiding precision is good enough, we can move now
+      if (n >= p->min_samples && sig_dra <= p->prec_arcsec && sig_ddec <= p->prec_arcsec) {
+        // Issue robust move
+        double cmd_dra = p->gain * med_dra;
+        double cmd_ddec = p->gain * med_ddec;
 
         if (p->verbose) {
-          fprintf(stderr, "  Robust scatter: sig_dra=%.3f\" sig_ddec=%.3f\" (target < %.3f\")\n",
-                  sig_a, sig_d, p->prec_arcsec);
+          fprintf(stderr, "MOVE (robust median): dra=%.3f"" ddec=%.3f""  (gain=%.3f)\n", cmd_dra, cmd_ddec, p->gain);
         }
 
-        if (sig_a < p->prec_arcsec && sig_d < p->prec_arcsec) {
-          if (p->verbose) fprintf(stderr, "  Precision requirement met; stop gathering.\n");
-          break;
-        }
+        (void)tcs_move_arcsec(cmd_dra, cmd_ddec, p->dry_run, p->verbose);
+
+        // After move, reject a few new frames to avoid trailed exposures.
+        if (p->settle_sec > 0) sleep_seconds(p->settle_sec);
+        skip_after_move = p->reject_after_move;
+
+        // proceed to next cycle
+        goto next_cycle;
       }
-
-      sleep_seconds(p->cadence_sec);
     }
 
-    if (ns <= 0) {
-      fprintf(stderr, "No valid samples collected in cycle %d; continuing.\n", cycle);
-      free(dra); free(ddec); free(r);
-      continue;
+    // If we get here, we did not reach required precision.
+    if (n >= p->min_samples) {
+      double dra_tmp[p->max_samples];
+      double ddec_tmp[p->max_samples];
+      for (int i = 0; i < n; i++) { dra_tmp[i]=dra_samp[i]; ddec_tmp[i]=ddec_samp[i]; }
+      double med_dra = median_of_doubles(dra_tmp, n);
+      double med_ddec = median_of_doubles(ddec_tmp, n);
+      double sig_dra = mad_sigma_of_doubles(dra_samp, n, med_dra);
+      double sig_ddec = mad_sigma_of_doubles(ddec_samp, n, med_ddec);
+      double rmed = hypot(med_dra, med_ddec);
+
+      fprintf(stderr, "FAIL: insufficient precision to move safely after %d samples (attempts=%d).\n", n, attempts);
+      fprintf(stderr, "      median(dra,ddec)=(%.3f,%.3f)""  scatter(MAD)=(%.3f,%.3f)""  |med|=%.3f""\n",
+              med_dra, med_ddec, sig_dra, sig_ddec, rmed);
+    } else {
+      fprintf(stderr, "FAIL: too few valid samples (n=%d) after attempts=%d.\n", n, attempts);
     }
 
-    // Robust central value (median)
-    double* tmpa = (double*)malloc((size_t)ns*sizeof(double));
-    double* tmpd = (double*)malloc((size_t)ns*sizeof(double));
-    if (!tmpa || !tmpd) die("malloc tmp med2 failed");
-    memcpy(tmpa, dra, (size_t)ns*sizeof(double));
-    memcpy(tmpd, ddec, (size_t)ns*sizeof(double));
-    double med_a = median_of_doubles(tmpa, ns);
-    double med_d = median_of_doubles(tmpd, ns);
-    free(tmpa); free(tmpd);
+    if (!p->continue_on_fail) return 2;
 
-    double rmed = hypot(med_a, med_d);
-
-    if (p->verbose) {
-      fprintf(stderr, "Robust offsets (median of %d): dra=%.3f\" ddec=%.3f\" r=%.3f\"\n", ns, med_a, med_d, rmed);
-    }
-
-    // Stop if converged
-    if (rmed <= p->goal_arcsec) {
-      if (p->verbose) fprintf(stderr, "Converged: r <= %.3f\".\n", p->goal_arcsec);
-      free(dra); free(ddec); free(r);
-      return 0;
-    }
-
-    // Command a move
-    double dra_move = p->gain * med_a;
-    double ddec_move = p->gain * med_d;
-
-    if (p->verbose) {
-      fprintf(stderr, "Issuing move (gain=%.2f): dra=%.3f\" ddec=%.3f\"\n", p->gain, dra_move, ddec_move);
-    }
-
-    (void)tcs_move_arcsec(dra_move, ddec_move, p);
-
-    free(dra); free(ddec); free(r);
-
-    // Let system settle a bit; also allow new frames to arrive
-    sleep_seconds(p->cadence_sec);
+next_cycle:
+    ;
   }
 
   if (g_stop) {
-    fprintf(stderr, "Stopped by user (Ctrl+C).\n");
-    return 0;
+    fprintf(stderr, "Stopped by user (SIGINT).\n");
+    return 1;
   }
 
-  fprintf(stderr, "Reached max cycles (%d) without converging.\n", p->max_cycles);
+  fprintf(stderr, "FAILED: reached max cycles (%d) without convergence.\n", p->max_cycles);
   return 1;
 }
 
@@ -1574,31 +1752,33 @@ int main(int argc, char** argv)
   int pr = parse_args(argc, argv, &p);
   if (pr <= 0) { usage(argv[0]); return (pr == 0) ? 0 : 4; }
 
-  // Basic sanity that file exists
-  {
-    time_t mt=0; off_t sz=0;
-    if (stat_file_basic(p.input, &mt, &sz) != 0) {
-      fprintf(stderr, "ERROR: --input is not a readable regular file: %s\n", p.input);
-      return 4;
-    }
-  }
-
   if (p.verbose) {
     fprintf(stderr,
-            "NGPS acquisition starting:\n"
-            "  input=%s goal=(%.3f,%.3f) origin=%d max_dist=%.1f snr=%.1f min_adj=%d\n"
-            "  filt_sigma=%.2f centroid_hw=%d centroid_sigma=%.2f extname=%s extnum=%d\n"
-            "  dra_cosdec=%d tcs_sign=%d tcs_set_units=%d\n"
-            "  loop=%d cadence=%.2f goal_arcsec=%.3f prec_arcsec=%.3f gain=%.2f\n"
-            "  debug=%d debug_out=%s dry_run=%d\n",
-            p.input, p.goal_x, p.goal_y, p.pixel_origin, p.max_dist_pix, p.snr_thresh, p.min_adjacent,
-            p.filt_sigma_pix, p.centroid_halfwin, p.centroid_sigma_pix,
-            (p.extname[0] ? p.extname : "(none)"), p.extnum,
-            p.dra_use_cosdec, p.tcs_sign, p.tcs_set_units,
-            p.loop, p.cadence_sec, p.goal_arcsec, p.prec_arcsec, p.gain,
-            p.debug, p.debug_out, p.dry_run);
+      "NGPS ACQ start:\n"
+      "  mode=%s input=%s framegrab_out=%s\n"
+      "  goal=(%.3f,%.3f) origin=%d max_dist=%.1f snr=%.1f filt_sigma=%.2f\n"
+      "  centroid_hw=%d centroid_sigma=%.2f\n"
+      "  loop=%d cadence=%.2fs max_samples=%d min_samples=%d prec=%.3f\" goal=%.3f\" gain=%.2f\n"
+      "  reject_identical=%d reject_after_move=%d settle=%.2fs max_move=%.2f\"\n"
+      "  tcs_set_units=%d dra_use_cosdec=%d tcs_sign=%d dry_run=%d\n",
+      (p.frame_mode == FRAME_FRAMEGRAB) ? "framegrab" : "stream",
+      p.input, p.framegrab_out,
+      p.goal_x, p.goal_y, p.pixel_origin, p.max_dist_pix, p.snr_thresh, p.filt_sigma_pix,
+      p.centroid_halfwin, p.centroid_sigma_pix,
+      p.loop, p.cadence_sec, p.max_samples, p.min_samples, p.prec_arcsec, p.goal_arcsec, p.gain,
+      p.reject_identical, p.reject_after_move, p.settle_sec, p.max_move_arcsec,
+      p.tcs_set_units, p.dra_use_cosdec, p.tcs_sign, p.dry_run);
   }
 
-  if (!p.loop) return run_one_shot(&p);
-  return run_closed_loop(&p);
+  if (p.loop) {
+    return run_loop(&p);
+  }
+
+  // One-shot: acquire one frame and (optionally) move once.
+  if (p.tcs_set_units) (void)tcs_set_native_units(p.dry_run, p.verbose);
+  FrameState fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.t_accept.tv_sec = 0;
+  fs.t_accept.tv_nsec = 0;
+  return process_once(&p, &fs);
 }
