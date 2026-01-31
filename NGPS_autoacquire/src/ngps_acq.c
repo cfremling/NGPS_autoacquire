@@ -132,7 +132,6 @@ typedef struct {
 
   // SCAM daemon option (guiding-friendly moves)
   int    use_putonslit;          // if 1: call putonslit <slitra> <slitdec> <crossra> <crossdec>
-  char   putonslit_cmd[PATH_MAX];
 
   // Debug
   int    debug;
@@ -886,15 +885,16 @@ static void slit_cross_from_offsets(const AcqParams* p,
   *cross_ra_deg  = wrap_ra_deg(slit_ra_deg + dra_deg);
 }
 
-static int scam_putonslit_deg(const char* putonslit_cmd,
-                              double slit_ra_deg, double slit_dec_deg,
+// Hard-coded interface: call via the SCAM daemon.
+// Intentionally NOT user-adjustable.
+static int scam_putonslit_deg(double slit_ra_deg, double slit_dec_deg,
                               double cross_ra_deg, double cross_dec_deg,
                               int dry_run, int verbose)
 {
   char cmd[1024];
   // putonslit <slitra> <slitdec> <crossra> <crossdec>  (all decimal degrees)
-  snprintf(cmd, sizeof(cmd), "%s %.10f %.10f %.10f %.10f",
-           putonslit_cmd, slit_ra_deg, slit_dec_deg, cross_ra_deg, cross_dec_deg);
+  snprintf(cmd, sizeof(cmd), "scam putonslit %.10f %.10f %.10f %.10f",
+           slit_ra_deg, slit_dec_deg, cross_ra_deg, cross_dec_deg);
 
   if (verbose || dry_run) fprintf(stderr, "SCAM CMD: %s\n", cmd);
   if (dry_run) return 0;
@@ -1354,7 +1354,6 @@ static void usage(const char* argv0)
     "TCS conventions:\n"
     "  --tcs-set-units 0|1          Set native dra/ddec units to arcsec once (default 1)\n"
     "  --use-putonslit 0|1          Use scam daemon putonslit for moves (default 0)\n"
-    "  --putonslit-cmd PATH          Command name/path for putonslit (default putonslit)\n"
     "  --dra-use-cosdec 0|1         dra = dRA*cos(dec) (default 1)\n"
     "  --tcs-sign +1|-1             Multiply commanded offsets by sign (default +1)\n"
     "\n"
@@ -1419,7 +1418,6 @@ static void set_defaults(AcqParams* p)
   p->tcs_set_units = 1;
 
   p->use_putonslit = 0;
-  snprintf(p->putonslit_cmd, sizeof(p->putonslit_cmd), "putonslit");
 
   p->debug = 0;
   snprintf(p->debug_out, sizeof(p->debug_out), "./ngps_acq_debug.ppm");
@@ -1524,8 +1522,6 @@ static int parse_args(int argc, char** argv, AcqParams* p)
 
     } else if (!strcmp(a, "--use-putonslit") && i+1 < argc) {
       p->use_putonslit = atoi(argv[++i]);
-    } else if (!strcmp(a, "--putonslit-cmd") && i+1 < argc) {
-      snprintf(p->putonslit_cmd, sizeof(p->putonslit_cmd), "%s", argv[++i]);
 
     } else if (!strcmp(a, "--debug") && i+1 < argc) {
       p->debug = atoi(argv[++i]);
@@ -1643,14 +1639,14 @@ static int process_once(const AcqParams* p, FrameState* fs)
     double dra = p->gain * fr.dra_cmd_arcsec;
     double ddec = p->gain * fr.ddec_cmd_arcsec;
 
-        if (p->use_putonslit) {
+    if (p->use_putonslit) {
       if (!fr.wcs_ok) {
         fprintf(stderr, "REFUSE MOVE: WCS not available for putonslit\n");
         return 3;
       }
       double cross_ra=0.0, cross_dec=0.0;
       slit_cross_from_offsets(p, fr.ra_goal_deg, fr.dec_goal_deg, dra, ddec, &cross_ra, &cross_dec);
-      (void)scam_putonslit_deg(p->putonslit_cmd, fr.ra_goal_deg, fr.dec_goal_deg, cross_ra, cross_dec, p->dry_run, p->verbose);
+      (void)scam_putonslit_deg(fr.ra_goal_deg, fr.dec_goal_deg, cross_ra, cross_dec, p->dry_run, p->verbose);
     } else {
       (void)tcs_move_arcsec(dra, ddec, p->dry_run, p->verbose);
     }
@@ -1786,13 +1782,13 @@ static int run_loop(const AcqParams* p)
           fprintf(stderr, "MOVE (robust median): dra=%.3f"" ddec=%.3f""  (gain=%.3f)\n", cmd_dra, cmd_ddec, p->gain);
         }
 
-                if (p->use_putonslit) {
+        if (p->use_putonslit) {
           if (!have_slit) {
             fprintf(stderr, "REFUSE MOVE: missing slit RA/Dec for putonslit\n");
           } else {
             double cross_ra=0.0, cross_dec=0.0;
             slit_cross_from_offsets(p, slit_ra_deg, slit_dec_deg, cmd_dra, cmd_ddec, &cross_ra, &cross_dec);
-            (void)scam_putonslit_deg(p->putonslit_cmd, slit_ra_deg, slit_dec_deg, cross_ra, cross_dec, p->dry_run, p->verbose);
+            (void)scam_putonslit_deg(slit_ra_deg, slit_dec_deg, cross_ra, cross_dec, p->dry_run, p->verbose);
           }
         } else {
           (void)tcs_move_arcsec(cmd_dra, cmd_ddec, p->dry_run, p->verbose);
@@ -1858,14 +1854,14 @@ int main(int argc, char** argv)
       "  centroid_hw=%d centroid_sigma=%.2f\n"
       "  loop=%d cadence=%.2fs max_samples=%d min_samples=%d prec=%.3f\" goal=%.3f\" gain=%.2f\n"
       "  reject_identical=%d reject_after_move=%d settle=%.2fs max_move=%.2f\"\n"
-      "  use_putonslit=%d putonslit_cmd=%s  tcs_set_units=%d dra_use_cosdec=%d tcs_sign=%d dry_run=%d\n",
+      "  use_putonslit=%d  tcs_set_units=%d dra_use_cosdec=%d tcs_sign=%d dry_run=%d\n",
       (p.frame_mode == FRAME_FRAMEGRAB) ? "framegrab" : "stream",
       p.input, p.framegrab_out,
       p.goal_x, p.goal_y, p.pixel_origin, p.max_dist_pix, p.snr_thresh, p.filt_sigma_pix,
       p.centroid_halfwin, p.centroid_sigma_pix,
       p.loop, p.cadence_sec, p.max_samples, p.min_samples, p.prec_arcsec, p.goal_arcsec, p.gain,
       p.reject_identical, p.reject_after_move, p.settle_sec, p.max_move_arcsec,
-      p.use_putonslit, p.putonslit_cmd, p.tcs_set_units, p.dra_use_cosdec, p.tcs_sign, p.dry_run);
+      p.use_putonslit, p.tcs_set_units, p.dra_use_cosdec, p.tcs_sign, p.dry_run);
   }
 
   if (p.loop) {
